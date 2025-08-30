@@ -1,0 +1,11 @@
+# Core ML + Data
+numpy
+pandas
+scikit-learn
+
+# Backend
+fastapi
+uvicorn[standard]
+
+# Utils
+python-multipart
