@@ -1,0 +1,12 @@
+{
+  "name": "graph-catalyst-ml",
+  "version": "1.0.0",
+  "description": "**Graph-Based Machine Learning for Catalyst Property Prediction and Design**",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
