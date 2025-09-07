@@ -1,0 +1,137 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>Graph Catalyst - ML</title>
+    <meta name="description" content="Predict catalyst and loading (mol %) for organic reactions" />
+    <link rel="stylesheet" href="./styles.css" />
+</head>
+
+<body>
+    <div class="app">
+        <header class="topbar">
+            <div class="brand">
+                <svg class="logo" viewBox="0 0 24 24" aria-hidden="true">
+                    <defs></defs>
+                    <path fill="currentColor" d="M3 3h8v8H3zM13 3h8v8h-8zM3 13h8v8H3zM13 13h8v8h-8z"></path>
+                </svg>
+                <div>
+                    <h1>Graph Catalyst ML</h1>
+                    <p class="muted">Catalyst identity + loading (mol %) recommender</p>
+                </div>
+            </div>
+            <nav class="nav">
+                <button id="demo-btn" class="btn ghost">Try demo</button>
+            </nav>
+        </header>
+
+        <main class="container">
+            <section class="left-pane">
+                <form id="predict-form" class="card form-card" autocomplete="off" aria-labelledby="form-title">
+                    <h2 id="form-title">Enter reaction (SMILES or text)</h2>
+
+                    <label class="field">
+                        <span class="label-text">Reaction SMILES</span>
+                        <textarea id="smiles" name="smiles" placeholder="e.g. BrC1=CC=CC=C1.B(O)O>>Biphenyl" rows="3"
+                            required></textarea>
+                        <small class="hint">Use reaction SMILES (reactants.reagents>>product) or paste your short
+                            description.</small>
+                    </label>
+
+                    <div class="row">
+                        <label class="field small">
+                            <span class="label-text">Solvent</span>
+                            <input id="solvent" name="solvent" placeholder="e.g. THF" />
+                        </label>
+                        <label class="field small">
+                            <span class="label-text">Base</span>
+                            <input id="base" name="base" placeholder="e.g. K3PO4" />
+                        </label>
+                        <label class="field small">
+                            <span class="label-text">Temp (°C)</span>
+                            <input id="temp" name="temp" placeholder="e.g. 80" inputmode="numeric" />
+                        </label>
+                    </div>
+
+                    <div class="actions">
+                        <button type="submit" id="run-btn" class="btn primary">Predict Catalyst</button>
+                        <button type="button" id="clear-btn" class="btn ghost">Clear</button>
+                        <div class="spacer"></div>
+                        <div id="status-area" aria-live="polite"></div>
+                    </div>
+
+                    <div class="samples">
+                        <strong>Quick samples</strong>
+                        <div class="sample-list" id="sample-list">
+                            <!-- js will populate  -->
+                        </div>
+                    </div>
+                </form>
+
+                <section class="card info-card">
+                    <h3>How it works</h3>
+                    <p class="muted">This UI sends your reaction to the model server and receives the recommended
+                        catalyst and suggested loading (mol %). Results include alternatives and similar dataset
+                        examples to give context.</p>
+                    <ul class="notes">
+                        <li>Paste reaction SMILES or a short textual reaction description.</li>
+                        <li>Server to expose <code>POST /predict</code> with JSON responses.</li>
+                        <li>Click <em>Try demo</em> to see a mock run if server is offline.</li>
+                    </ul>
+                </section>
+            </section>
+
+            <aside class="right-pane">
+                <section class="card result-card" id="result-card" aria-hidden="true">
+                    <div class="result-header">
+                        <h3>Prediction</h3>
+                        <div class="result-actions">
+                            <button id="copy-btn" class="btn tiny">Copy</button>
+                            <button id="download-btn" class="btn tiny ghost">Download</button>
+                        </div>
+                    </div>
+
+                    <div id="main-result" class="main-result">
+                        <!-- js renders this -->
+                        <div class="placeholder">
+                            <svg class="placeholder-gear" viewBox="0 0 24 24" aria-hidden="true">
+                                <path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8z"></path>
+                            </svg>
+                            <p class="muted">Run a prediction to see results here. We'll show catalyst, loading,
+                                alternatives and similar reactions.</p>
+                        </div>
+                    </div>
+
+                    <div id="alternatives" class="alternatives" aria-hidden="true">
+                        <!-- top 3 bars render here-->
+                    </div>
+
+                    <details id="similar-panel" class="similar-panel" aria-hidden="true">
+                        <summary>Nearest similar reactions</summary>
+                        <div id="similar-list" class="similar-list">
+                            <!-- js populates -->
+                        </div>
+                    </details>
+                </section>
+
+                <section class="card logs-card" id="logs-card">
+                    <h4>Interaction log</h4>
+                    <div id="log-entries" class="log-entries">
+                        <!-- runtime logs (?) -->
+                    </div>
+                </section>
+            </aside>
+        </main>
+
+        <footer class="footer">
+            <span class="muted">Expects POST /predict</span>
+            <span class="muted"> · v0.1</span>
+        </footer>
+    </div>
+
+    <script src="./script.js" type="module"></script>
+</body>
+
+</html>
