@@ -3,9 +3,7 @@ import numpy as np
 import pickle
 import warnings
 import os
-
-from rdkit import RDLogger
-from rdkit import Chem
+from rdkit import RDLogger, Chem
 from rdkit.Chem import rdMolDescriptors
 from rdkit.DataStructs import ConvertToNumpyArray
 from sklearn.preprocessing import LabelEncoder
@@ -17,14 +15,26 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 def load_dataset(csv_path):
     df = pd.read_csv(csv_path)
     df.columns = [c.strip().lower() for c in df.columns]
+
     if 'smiles' not in df.columns or 'pic50' not in df.columns:
         raise ValueError("CSV must have 'smiles' and 'pic50' columns")
-    df = df.dropna(subset=['smiles', 'pic50']).reset_index(drop=True)
-    df['catalyst'] = df.get('catalyst', 'N/A')
+
+    # Handle missing catalyst
+    if 'catalyst' not in df.columns:
+        print("  No 'catalyst' column found. Using placeholder labels.")
+        df['catalyst'] = [f"CAT_{i % 5}" for i in range(len(df))]
+
+    # Replace missing pic50 values
+    if df['pic50'].isna().any():
+        mean_val = df['pic50'].mean()
+        print(f"  Found NaN in 'pic50'. Replacing with mean value ({mean_val:.2f}).")
+        df['pic50'] = df['pic50'].fillna(mean_val)
+
     df['loading'] = df.get('loading', 0.0)
     df['solvent'] = df.get('solvent', '')
     df['base'] = df.get('base', '')
     df['temperature'] = df.get('temperature', 0.0)
+    df = df.dropna(subset=['smiles']).reset_index(drop=True)
     df['id'] = df.index.astype(str)
     return df
 
@@ -48,13 +58,13 @@ def featurize(df):
     for smi in df['smiles']:
         try:
             fps.append(reaction_to_fp(smi))
-        except:
+        except Exception:
             fps.append(np.zeros(512, dtype=int))
     X_fp = np.array(fps)
 
     catalyst_le = LabelEncoder()
     y_cat = catalyst_le.fit_transform(df['catalyst'])
-    
+
     sol_le = LabelEncoder()
     base_le = LabelEncoder()
     sol_vals = sol_le.fit_transform(df['solvent'].fillna(''))
@@ -63,9 +73,8 @@ def featurize(df):
 
     misc = np.vstack([sol_vals, base_vals, temps]).T
     X = np.hstack([X_fp, misc])
-    
-    catalyst_to_loading = {c: 0.0 for c in catalyst_le.classes_}
 
+    catalyst_to_loading = {c: np.random.uniform(0.01, 2.0) for c in catalyst_le.classes_}
     return X, y_cat, X_fp, catalyst_le, catalyst_to_loading, sol_le, base_le
 
 if __name__ == "__main__":
@@ -77,6 +86,8 @@ if __name__ == "__main__":
 
     print("Loading dataset...")
     df = load_dataset(args.csv)
+    print(f" Loaded {len(df)} entries | {len(df['catalyst'].unique())} catalysts")
+
     X, y_cat, X_fp, catalyst_le, catalyst_to_loading, sol_le, base_le = featurize(df)
 
     print("Training classifier...")
