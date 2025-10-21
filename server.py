@@ -1,9 +1,30 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pickle
 from src.data import reaction_to_fp
 import numpy as np
 from sklearn.metrics.pairwise import cosine_similarity
+from rdkit import Chem
+from pydantic import BaseModel
+
+class PredictRequest(BaseModel):
+    smiles: str
+    solvent: str = ""
+    base: str = ""
+    temperature: float = 0.0
+
+def featurize_request(req: PredictRequest):
+    mol = Chem.MolFromSmiles(req.smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {req.smiles}")
+    fp = reaction_to_fp(req.smiles)
+    if fp.shape[0] != 512:
+        fp_resized = np.zeros(512, dtype=int)
+        length = min(len(fp), 512)
+        fp_resized[:length] = fp[:length]
+        fp[:length] = fp_resized[:length]
+    ...
 
 with open("model/artifacts.pkl", "rb") as f:
     artifacts = pickle.load(f)
@@ -20,23 +41,39 @@ train_loading = artifacts["train_loading"]
 
 app = FastAPI(title="Graph Catalyst ML")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class PredictRequest(BaseModel):
     smiles: str
     solvent: str = ""
     base: str = ""
     temperature: float = 0.0
 
-def featurize_request(req: PredictRequest):
-    # fingerprint
-    fp = reaction_to_fp(req.smiles)
-    if fp.shape[0] != 512:
-        fp = np.zeros(512, dtype=int)
 
-    sol_val = 0
+def featurize_request(req: PredictRequest):
+    """Convert input request into ML model feature vector."""
+    fp = reaction_to_fp(req.smiles)
+
+    if fp.shape[0] != 512:
+
+        # try resizing 
+        fp_resized = np.zeros(512, dtype=int)
+        length = min(len(fp), 512)
+        fp_resized[:length] = fp[:length]
+        fp = fp_resized
+
+    # encode solvent/base; unknowns get -1 to avoid clashing with training classes
+    sol_val = -1
     if sol_le and req.solvent and req.solvent in sol_le.classes_:
         sol_val = sol_le.transform([req.solvent])[0]
 
-    base_val = 0
+    base_val = -1
     if base_le and req.base and req.base in base_le.classes_:
         base_val = base_le.transform([req.base])[0]
 
@@ -46,21 +83,21 @@ def featurize_request(req: PredictRequest):
     X = np.hstack([fp, misc]).reshape(1, -1)  # shape = (1, 515)
     return X
 
+
 @app.post("/predict")
 def predict(req: PredictRequest):
     X = featurize_request(req)
 
-    # classifier 
+    # catalyst pred
     catalyst_idx = clf.predict(X)[0]
     catalyst = catalyst_le.inverse_transform([catalyst_idx])[0]
 
-    # regressor
+    # oading pred
     loading = reg.predict(X)[0]
 
-    # confidence score
     conf = clf.predict_proba(X).max()
 
-    # top alt catalysts
+    # top 3 alts
     top_idx = np.argsort(clf.predict_proba(X)[0])[::-1][1:4]
     alternatives = []
     for idx in top_idx:
@@ -70,7 +107,7 @@ def predict(req: PredictRequest):
             "score": float(clf.predict_proba(X)[0][idx])
         })
 
-    # similarity search on fingerprints only
+    # top 3 similar rxns
     sims = cosine_similarity(X[:, :512], train_fp)[0]
     top_sim_idx = sims.argsort()[::-1][:3]
     similar_reactions = []
@@ -92,6 +129,7 @@ def predict(req: PredictRequest):
         "alternatives": alternatives,
         "similar_reactions": similar_reactions
     }
+
 
 @app.get("/")
 def read_root():
