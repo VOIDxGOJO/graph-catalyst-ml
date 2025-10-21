@@ -49,11 +49,12 @@ function setStatus(txt, isError = false) {
 
 form.addEventListener('submit', async (e) => {
     e.preventDefault();
+    const tempVal = tempInput.value.trim();
     const payload = {
         smiles: smilesInput.value.trim(),
         solvent: solventInput.value.trim(),
         base: baseInput.value.trim(),
-        temperature: tempInput.value.trim()
+        temperature: tempVal === "" ? null : Number(tempVal)
     };
     await runPrediction(payload);
 });
