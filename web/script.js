@@ -1,5 +1,4 @@
-
-const API_ENDPOINT = "/predict";
+const API_ENDPOINT = "http://127.0.0.1:8000/predict";
 
 const form = document.getElementById("predict-form");
 const smilesInput = document.getElementById("smiles");
@@ -20,12 +19,11 @@ const clearBtn = document.getElementById("clear-btn");
 const copyBtn = document.getElementById("copy-btn");
 const downloadBtn = document.getElementById("download-btn");
 
-// sample reactions 
 const SAMPLES = [
-    { label: "Suzuki: bromobenzene + phenylboronic acid", smiles: "BrC1=CC=CC=C1.B(O)O>>Biphenyl", solvent: "THF", base: "K3PO4", temp: "80" },
-    { label: "Buchwald-Hartwig (example)", smiles: "ClC1=CC=CC=C1.N(CC)2>>Aniline", solvent: "Toluene", base: "NaOtBu", temp: "110" },
-    { label: "Heck (example)", smiles: "BrC1=CC=CC=C1.C=CC>>stilbene", solvent: "DMF", base: "Et3N", temp: "100" }
+    { label: "EM 1", smiles: "O=S(=O)(Nc1cccc(-c2cnc3ccccc3n2)c1)c1cccs1", solvent: "", base: "", temp: "25" },
+    { label: "EM 2", smiles: "NC(=O)c1ccc2c(c1)nc(C1CCC(O)CC1)n2CCCO", solvent: "", base: "", temp: "25" }
 ];
+
 
 function initSamples() {
     SAMPLES.forEach(s => {
@@ -33,235 +31,110 @@ function initSamples() {
         b.type = "button";
         b.className = "sample-item";
         b.textContent = s.label;
-        b.onclick = () => {
-            smilesInput.value = s.smiles;
-            solventInput.value = s.solvent;
-            baseInput.value = s.base;
-            tempInput.value = s.temp;
-        };
+        b.onclick = () => { smilesInput.value = s.smiles; solventInput.value = s.solvent; baseInput.value = s.base; tempInput.value = s.temp; };
         sampleList.appendChild(b);
     });
 }
 
 function log(msg) {
     const line = document.createElement('div');
-    const t = new Date().toLocaleTimeString();
-    line.textContent = `[${t}] ${msg}`;
-    logEntries.prepend(line);
+    line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
+    logEntries?.prepend(line);
 }
 
-// show status helper
 function setStatus(txt, isError = false) {
     statusArea.textContent = txt;
     statusArea.style.color = isError ? "#ffb4b4" : "inherit";
 }
 
-// form events
 form.addEventListener('submit', async (e) => {
     e.preventDefault();
-    const smiles = (smilesInput.value || "").trim();
-    if (!smiles) {
-        setStatus("Please enter reaction SMILES or description", true);
-        return;
-    }
     const payload = {
-        smiles,
-        solvent: (solventInput.value || "").trim(),
-        base: (baseInput.value || "").trim(),
-        temperature: (tempInput.value || "").trim()
+        smiles: smilesInput.value.trim(),
+        solvent: solventInput.value.trim(),
+        base: baseInput.value.trim(),
+        temperature: tempInput.value.trim()
     };
     await runPrediction(payload);
 });
 
-clearBtn.addEventListener('click', (e) => {
-    smilesInput.value = "";
-    solventInput.value = "";
-    baseInput.value = "";
-    tempInput.value = "";
-    mainResult.innerHTML = `
-    <div class="placeholder">
-      <svg class="placeholder-gear" viewBox="0 0 24 24" aria-hidden="true"><path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8z"></path></svg>
-      <p class="muted">Run a prediction to see results here.</p>
-    </div>`;
-    alternativesEl.innerHTML = "";
-    similarList.innerHTML = "";
-    setStatus("");
-});
+clearBtn.addEventListener('click', () => location.reload());
+demoBtn.addEventListener('click', () => runMockPrediction(SAMPLES[0]));
 
-// demo button
-demoBtn.addEventListener('click', async () => {
-    const demo = SAMPLES[0];
-    smilesInput.value = demo.smiles;
-    solventInput.value = demo.solvent;
-    baseInput.value = demo.base;
-    tempInput.value = demo.temp;
-    await runMockPrediction(demo);
-});
+async function runPrediction(payload) {
+    setStatus("Running prediction...");
+    mainResult.innerHTML = `<div class="placeholder"><p class="muted">Waiting for model...</p></div>`;
+    try {
+        const resp = await fetch(API_ENDPOINT, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+        const data = await resp.json();
 
-// copy, download
-copyBtn.addEventListener('click', async () => {
-    const txt = getProtocolTextFromDOM();
-    try { await navigator.clipboard.writeText(txt); setStatus("Protocol copied to clipboard"); log("Copied protocol"); }
-    catch (e) { setStatus("Clipboard copy failed", true); }
-});
+        const pred = data.prediction || {};
+        const alts = data.alternatives || [];
+        const similar = data.similar_reactions || [];
 
-downloadBtn.addEventListener('click', () => {
-    const txt = getProtocolTextFromDOM();
-    const blob = new Blob([txt], { type: "text/plain;charset=utf-8" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = "protocol.txt";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    URL.revokeObjectURL(url);
-    log("Downloaded protocol.txt");
-});
-
-function getProtocolTextFromDOM() {
-    const catalyst = document.querySelector('.pred-catalyst')?.textContent ?? "N/A";
-    const loading = document.querySelector('.pred-loading')?.textContent ?? "N/A";
-    const conf = document.querySelector('.pred-confidence')?.textContent ?? "";
-    const s = `Suggested catalyst: ${catalyst}\nLoading: ${loading}\nConfidence: ${conf}\n\nReaction input: ${smilesInput.value}\nSolvent: ${solventInput.value}\nBase: ${baseInput.value}\nTemperature: ${tempInput.value}\n\n(Generated by Graph Catalyst ML)`;
-    return s;
+        showPredictionBlock(pred);
+        renderAlternatives(alts);
+        renderSimilar(similar);
+        setStatus("Prediction complete");
+        log(`Predicted ${pred.catalyst ?? "N/A"} (${pred.loading_mol_percent ?? "-"} mol%)`);
+    } catch (err) {
+        setStatus("Server unreachable. Try demo.", true);
+        log(`Network error: ${err.message}`);
+    }
 }
 
-// render helpers
 function showPredictionBlock(pred) {
-    // pred: { catalyst, loading_mol_percent, confidence, protocol_note }
-    const catalyst = pred.catalyst ?? "Unknown";
-    const loading = (pred.loading_mol_percent !== undefined) ? `${Number(pred.loading_mol_percent).toFixed(2)} mol%` : "—";
-    const conf = (pred.confidence !== undefined) ? `${Math.round(pred.confidence * 100)}%` : "—";
-
     mainResult.innerHTML = `
-    <div class="prediction" role="region" aria-live="polite">
+    <div class="prediction">
       <div class="pred-left">
-        <div class="pred-catalyst">${escapeHtml(catalyst)}</div>
-        <div class="pred-confidence">Confidence: <span class="pred-confidence">${conf}</span></div>
-        <div class="muted small" style="margin-top:6px">${escapeHtml(pred.protocol_note || "")}</div>
+        <div class="pred-catalyst">${pred.catalyst ?? "N/A"}</div>
+        <div class="pred-confidence">Confidence: ${Math.round((pred.confidence || 0) * 100)}%</div>
+        <div class="muted small">${pred.protocol_note || ""}</div>
       </div>
       <div class="pred-right">
-        <div class="pred-loading">${escapeHtml(loading)}</div>
+        <div class="pred-loading">${(pred.loading_mol_percent ?? 0).toFixed(2)} mol%</div>
         <div class="muted" style="font-size:13px">Suggested</div>
       </div>
-    </div>
-  `;
+    </div>`;
     resultCard.removeAttribute('aria-hidden');
 }
 
 function renderAlternatives(list) {
-    // list: [{catalyst, loading_mol_percent, score}, ...]
-
-    if (!list || !list.length) { alternativesEl.innerHTML = ""; alternativesEl.setAttribute('aria-hidden', 'true'); return; }
-    alternativesEl.setAttribute('aria-hidden', 'false');
-    alternativesEl.innerHTML = `<h4 style="margin:6px 0 8px 0">Top alternatives</h4>`;
-    list.forEach((alt) => {
-        const score = (alt.score || 0);
-        const pct = Math.max(2, Math.round(score * 100)); // min visible
-        const loading = (alt.loading_mol_percent !== undefined) ? `${Number(alt.loading_mol_percent).toFixed(2)} mol%` : "—";
-        const div = document.createElement('div');
-        div.className = 'alt-item';
-        div.innerHTML = `
-      <div style="width:160px;font-weight:600">${escapeHtml(alt.catalyst)}</div>
-      <div class="alt-bar" aria-hidden="true"><div class="alt-bar-fill" style="width:${pct}%"></div></div>
-      <div style="min-width:72px;text-align:right;font-size:13px">${escapeHtml(loading)}</div>
-    `;
-        alternativesEl.appendChild(div);
+    alternativesEl.innerHTML = "";
+    if (!list.length) return;
+    alternativesEl.innerHTML = `<h4>Top alternatives</h4>`;
+    list.forEach(a => {
+        const pct = Math.round((a.score || 0.5) * 100);
+        alternativesEl.innerHTML += `<div class="alt-item"><div style="width:140px">${a.catalyst}</div>
+      <div class="alt-bar"><div class="alt-bar-fill" style="width:${pct}%"></div></div>
+      <div style="min-width:60px;text-align:right">${(a.loading_mol_percent ?? 0).toFixed(2)} mol%</div></div>`;
     });
 }
 
 function renderSimilar(list) {
     similarList.innerHTML = "";
-    if (!list || !list.length) { similarPanel.setAttribute('aria-hidden', 'true'); return; }
-    similarPanel.removeAttribute('aria-hidden');
+    if (!list.length) return;
     list.forEach(s => {
-        const d = document.createElement('div');
-        d.className = 'similar-item';
-        d.innerHTML = `<div><strong>${escapeHtml(s.id || s.smiles || "example")}</strong><div class="muted" style="font-size:12px">${escapeHtml(s.smiles || "")}</div></div>
-                   <div style="text-align:right"><div style="font-weight:700">${escapeHtml(s.catalyst || "")}</div><div class="muted" style="font-size:12px">${escapeHtml(String(s.loading || ""))} mol%</div></div>`;
-        similarList.appendChild(d);
+        similarList.innerHTML += `<div class="similar-item">
+      <div><strong>${s.id || "RXN"}</strong><div class="muted" style="font-size:12px">${s.smiles}</div></div>
+      <div style="text-align:right"><strong>${s.catalyst}</strong><div class="muted" style="font-size:12px">${s.loading} mol%</div></div>
+    </div>`;
     });
 }
 
-// network run
-async function runPrediction(payload) {
-    setStatus("Running prediction...");
-    log(`Request: ${payload.smiles.substring(0, 120)}`);
-    mainResult.innerHTML = `<div class="placeholder"><p class="muted">Waiting for model response…</p></div>`;
-    alternativesEl.innerHTML = "";
-    similarList.innerHTML = "";
-
-    try {
-        const resp = await fetch(API_ENDPOINT, {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify(payload)
-        });
-
-        if (!resp.ok) {
-            const text = await resp.text();
-            setStatus(`Server error: ${resp.status}`, true);
-            mainResult.innerHTML = `<div class="placeholder"><p class="muted">Server error: ${resp.status} returned: ${text.slice(0, 200)}</p></div>`;
-            log(`Server error ${resp.status}`);
-            return;
-        }
-
-        const data = await resp.json();
-
-        // adapt to server key
-        const pred = data.prediction || data.pred || {};
-        const alts = data.alternatives || [];
-        const similar = data.similar_reactions || data.similar || [];
-
-        showPredictionBlock(pred);
-        renderAlternatives(alts);
-        renderSimilar(similar);
-
-        setStatus("Prediction complete");
-        log(`Prediction: ${pred.catalyst ?? "unknown"} (${pred.loading_mol_percent ?? "—"} mol%)`);
-    } catch (err) {
-        setStatus("Network or server error", true);
-        mainResult.innerHTML = `<div class="placeholder"><p class="muted">Network error or backend unreachable. Click <strong>Try demo</strong> to simulate output.</p></div>`;
-        log(`Network error: ${err.message}`);
-    }
-}
-
-// fallback
 async function runMockPrediction(payload) {
-    setStatus("Running demo prediction (client-side)");
-    log("Demo run started");
-
+    setStatus("Running demo...");
     const mock = {
-        prediction: {
-            catalyst: "Pd(PPh3)4",
-            loading_mol_percent: 2.5,
-            confidence: 0.86,
-            protocol_note: "Dry solvent, inert atmosphere. Stir 16 h."
-        },
-        alternatives: [
-            { catalyst: "Pd2(dba)3", loading_mol_percent: 3.0, score: 0.72 },
-            { catalyst: "Pd(PPh3)2Cl2", loading_mol_percent: 4.0, score: 0.56 },
-            { catalyst: "Pd(OAc)2", loading_mol_percent: 5.0, score: 0.42 }
-        ],
-        similar_reactions: [
-            { id: "RXN-1234", smiles: "PhBr + PhB(OH)2 -> Ph-Ph", catalyst: "Pd(PPh3)4", loading: 2.5 },
-            { id: "RXN-2345", smiles: "p-TolBr + PhB(OH)2 -> p-Tol-Ph", catalyst: "Pd2(dba)3", loading: 3 }
-        ]
+        prediction: { catalyst: "Pd(PPh3)4", loading_mol_percent: 2.5, confidence: 0.86, protocol_note: "Dry solvent, inert atmosphere" },
+        alternatives: [{ catalyst: "Pd2(dba)3", loading_mol_percent: 3, score: 0.72 }],
+        similar_reactions: [{ id: "RXN-001", smiles: "PhBr+PhB(OH)2→Ph-Ph", catalyst: "Pd(PPh3)4", loading: 2.5 }]
     };
-    // delay to simulate call
     await new Promise(r => setTimeout(r, 600));
     showPredictionBlock(mock.prediction);
     renderAlternatives(mock.alternatives);
     renderSimilar(mock.similar_reactions);
     setStatus("Demo complete");
-    log("Demo prediction displayed");
 }
 
-// escape helper
-function escapeHtml(s) { return String(s || "").replace(/[&<>"'`]/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;', '`': '&#96;' }[c])); }
-
-// init
 initSamples();
 log("Frontend ready");
-setStatus("");
