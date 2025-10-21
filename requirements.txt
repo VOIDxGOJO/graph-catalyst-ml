@@ -1,5 +1,5 @@
 # Core ML + Data
-numpy
+numpy<2
 pandas
 scikit-learn
 
