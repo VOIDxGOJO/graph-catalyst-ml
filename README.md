@@ -1,23 +1,18 @@
-# CatalystPropNet
+# Catalyst Predictor
 
-**Graph-Based Machine Learning for Catalyst Property Prediction and Design**
+**Machine Learning model for Catalyst Prediction**
 
-This project aims to predict catalyst properties and optimal catalyst usage for chemical reactions using machine learning models.  
+This project aims to predict catalyst and optimal catalyst usage for chemical reactions using machine learning models.  
 It helps reduce the need for repetitive laboratory experiments by providing computational predictions.
 
 ## Features
-- Data ingestion and preprocessing (structured catalyst datasets)
-- ML modeling (baseline linear regression → scalable to advanced models)
-- Web interface for reaction input & catalyst prediction
-- REST API backend for model serving
-- Modular directory structure with reproducibility in mind
+- Data ingestion and preprocessing (structured catalyst dataset)
+- Web interface for catalyst prediction
+- Flask backend for model serving
 
 ## Tech Stack
 - **Python** (pandas, scikit-learn, numpy, FastAPI)
 - **FastAPI** backend for serving predictions
-- **Next.js + Tailwind** for frontend UI
-- **Docker + docker-compose** for environment consistency
-- **Jupyter Notebooks** for exploratory data analysis
 
 ## Getting Started
 ```bash
