@@ -1,200 +1,133 @@
-# api/main.py
 from fastapi import FastAPI, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import pickle
+from typing import Optional, List, Dict, Any
+import joblib
 import numpy as np
-from sklearn.metrics.pairwise import cosine_similarity
-from rdkit import Chem
-from rdkit.Chem import AllChem
-from rdkit.DataStructs import ConvertToNumpyArray
-from typing import Optional
+from pathlib import Path
 
-# ---- Request / Response schemas ----
+from src.data import reaction_to_fp  # reuse same FP routine
+
+ARTIFACT_PATH = Path("models/artifacts.joblib")
+
+app = FastAPI(title="Graph Catalyst ML (ORDerly) - lightweight API")
+
+# load artifacts at startup
+@app.on_event("startup")
+def load_models():
+    global AR
+    if not ARTIFACT_PATH.exists():
+        raise RuntimeError(f"Artifacts not found at {ARTIFACT_PATH}. Train models first with src/train.py")
+    AR = joblib.load(str(ARTIFACT_PATH))
+    # AR has- clf_agent, clf_solvent, agent_le, solvent_le, nn_index, X_fp_all, df
+    print("Loaded artifacts. Models ready.")
+
 class PredictRequest(BaseModel):
-    smiles: str
-    solvent: Optional[str] = ""
-    base: Optional[str] = ""
-    temperature: Optional[float] = 0.0
+    smiles: Optional[str] = None
+    product_smiles: Optional[str] = None
+    solvent: Optional[str] = None
+    temperature_c: Optional[float] = None
+    rxn_time_h: Optional[float] = None
+    yield_percent: Optional[float] = None
 
-# ---- Load artifacts ----
-ARTIFACT_PATH = "model/artifacts.pkl"
-with open(ARTIFACT_PATH, "rb") as f:
-    artifacts = pickle.load(f)
-
-# Required objects (train script must have saved these)
-clf = artifacts.get("clf")
-reg = artifacts.get("reg")
-catalyst_le = artifacts.get("catalyst_le")
-sol_le = artifacts.get("sol_le")      # may be None
-base_le = artifacts.get("base_le")    # may be None
-
-train_fp = np.array(artifacts.get("train_fp"))  # shape (N, fp_dim)
-train_smiles = artifacts.get("train_smiles", [])
-train_catalyst = artifacts.get("train_catalyst", [])
-train_loading = artifacts.get("train_loading", [])
-catalyst_to_loading = artifacts.get("catalyst_to_loading", {})
-
-# infer fp_dim and feature_dim
-if train_fp is None or train_fp.size == 0:
-    raise RuntimeError("train_fp missing or empty in artifacts.pkl — cannot run similarity search")
-
-fp_dim = train_fp.shape[1]
-# assume training feature vector was fp_dim + 3 (solvent, base, temperature)
-# but if the artifacts stored 'feature_dim' prefer that
-feature_dim = artifacts.get("feature_dim", fp_dim + 3)
-
-# ---- helper: compute fingerprint the same way as training ----
-def compute_reaction_fp(reaction_smiles: str, nBits: int = None, radius: int = 2):
-    """
-    Create a combined Morgan fingerprint for the reactant side of a reaction SMILES.
-    Returns a numpy array of 0/1 ints length nBits (if provided) or train fp_dim by default.
-    """
-    if nBits is None:
-        nBits = fp_dim
-    reac_side = reaction_smiles.split(">>")[0]
-    parts = [p for p in reac_side.split(".") if p.strip()]
-    fp_arr = np.zeros((nBits,), dtype=int)
-    for part in parts:
-        mol = Chem.MolFromSmiles(part)
-        if mol is None:
-            # skip invalid substructure (we still allow prediction attempt)
-            continue
-        rdkit_fp = AllChem.GetMorganFingerprintAsBitVect(mol, radius, nBits=nBits)
-        tmp = np.zeros((nBits,), dtype=int)
-        ConvertToNumpyArray(rdkit_fp, tmp)
-        # combine via OR (same as training function)
-        fp_arr |= tmp
-    return fp_arr
-
-# ---- featurize incoming request to same dims as training ----
-def featurize_request(req: PredictRequest):
-    if not req.smiles or not isinstance(req.smiles, str):
-        raise ValueError("Missing or invalid smiles string")
-    fp = compute_reaction_fp(req.smiles, nBits=fp_dim)
-
-    # solvent encoding
-    if sol_le is not None and isinstance(req.solvent, str) and req.solvent.strip() != "":
-        try:
-            sol_val = int(sol_le.transform([req.solvent])[0])
-        except Exception:
-            # unknown: fallback to 0 (most common / safe)
-            sol_val = 0
-    else:
-        sol_val = 0
-
-    # base encoding
-    if base_le is not None and isinstance(req.base, str) and req.base.strip() != "":
-        try:
-            base_val = int(base_le.transform([req.base])[0])
-        except Exception:
-            base_val = 0
-    else:
-        base_val = 0
-
-    try:
-        temp_val = float(req.temperature) if req.temperature is not None else 0.0
-    except Exception:
-        temp_val = 0.0
-
-    misc = np.array([sol_val, base_val, temp_val], dtype=float)
-
-    # assemble final X vector - ensure correct length
-    X = np.hstack([fp.astype(float), misc])
-    if X.shape[0] != feature_dim:
-        # either pad or truncate to expected feature_dim (safer than crashing).
-        if X.shape[0] < feature_dim:
-            pad = np.zeros((feature_dim - X.shape[0],), dtype=float)
-            X = np.hstack([X, pad])
-        else:
-            X = X[:feature_dim]
-    # reshape for sklearn
-    return X.reshape(1, -1), fp.astype(float).reshape(1, -1)
-
-# ---- fastapi app ----
-app = FastAPI(title="Graph Catalyst ML")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-    allow_credentials=True,
-)
-
-@app.get("/")
-def read_root():
-    return {"message": "Graph Catalyst ML API running. POST /predict with JSON."}
+def _build_reaction_smiles(payload: PredictRequest) -> str:
+    if payload.smiles:
+        return payload.smiles
+    # fallback
+    left = ""
+    return left + (f">>{payload.product_smiles}" if payload.product_smiles else "")
 
 @app.post("/predict")
 def predict(payload: PredictRequest):
+    """
+    Returns JSON of this form (conservative):
+    {
+      "prediction": { "agent": "...", "solvent": "...", "confidence": 0.82, "protocol_note": "..." },
+      "alternatives": [ { "agent": "...", "solvent": "...", "score": 0.6 }, ... ],
+      "similar_reactions": [ { "id": "...", "smiles": "...", "agent": "...", "solvent": "...", "procedure_details": "..." }, ... ]
+    }
+    """
     try:
-        X, fp = featurize_request(payload)   # X used for model, fp used for similarity
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=str(e))
-
-    # classifier/regressor predictions
-    try:
-        pred_idx = int(clf.predict(X)[0])
-        catalyst = str(catalyst_le.inverse_transform([pred_idx])[0])
-        # probability (confidence)
-        proba = clf.predict_proba(X)[0]
-        confidence = float(np.max(proba))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"classifier error: {e}")
-
-    try:
-        loading = float(reg.predict(X)[0])
-    except Exception as e:
-        loading = float(catalyst_to_loading.get(catalyst, 0.0))
-
-    # alternatives = top 3 other catalysts by proba (excluding predicted)
-    try:
-        probs = clf.predict_proba(X)[0]
-        order = np.argsort(probs)[::-1]
-        alt_idx = [i for i in order if i != pred_idx][:3]
-        alternatives = []
-        for i in alt_idx:
-            cat_name = str(catalyst_le.inverse_transform([int(i)])[0])
-            alternatives.append({
-                "catalyst": cat_name,
-                "loading_mol_percent": float(round(catalyst_to_loading.get(cat_name, loading), 4)),
-                "score": float(probs[i])
-            })
-    except Exception:
-        alternatives = []
-
-    # similar reactions: use cosine similarity between fp and train_fp
-    try:
-        # ensure train_fp is float and same dims
-        train_matrix = train_fp.astype(float)
-        if train_matrix.shape[1] != fp.shape[1]:
-            # try to resize train_fp or fp (rare). We'll do safe broadcast/truncate
-            min_dim = min(train_matrix.shape[1], fp.shape[1])
-            train_matrix = train_matrix[:, :min_dim]
-            fp_sim = fp[:, :min_dim]
+        rxn = _build_reaction_smiles(payload)
+        fp = reaction_to_fp(rxn, radius=AR['agent_le'].classes_.shape[0] if False else 2, nBits=AR['X_fp_all'].shape[1])
+        # ensure correct shape
+        if fp.ndim == 1:
+            X = fp.reshape(1, -1)
         else:
-            fp_sim = fp
-        sims = cosine_similarity(fp_sim, train_matrix)[0]  # shape (N,)
-        top_sim_idx = np.argsort(sims)[::-1][:3]
-        similar_reactions = []
-        for i in top_sim_idx:
-            similar_reactions.append({
-                "id": f"RXN-{i}",
-                "smiles": train_smiles[i] if i < len(train_smiles) else "",
-                "catalyst": train_catalyst[i] if i < len(train_catalyst) else "",
-                "loading": float(train_loading[i]) if i < len(train_loading) else 0.0
+            X = np.array(fp).reshape(1, -1)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid SMILES or fingerprint error: {e}")
+
+    # agent prediction
+    clf_agent = AR.get('clf_agent')
+    agent_le = AR.get('agent_le')
+    agent_pred = None
+    agent_conf = None
+    alternatives = []
+    if clf_agent is not None:
+        probs = clf_agent.predict_proba(X)[0]
+        top_idx = np.argsort(probs)[::-1]  # descending
+        top0 = top_idx[0]
+        agent_pred_label = agent_le.inverse_transform([top0])[0]
+        agent_pred = None if agent_pred_label == '<<NULL>>' else agent_pred_label
+        agent_conf = float(probs[top0])
+        # alt top-5 excluding NULL
+        alt_list = []
+        for tid in top_idx[:10]:
+            label = agent_le.inverse_transform([tid])[0]
+            if label == '<<NULL>>':
+                continue
+            alt_list.append({"agent": label, "score": float(probs[tid])})
+            if len(alt_list) >= 5:
+                break
+        alternatives = alt_list
+
+    # solvent prediction
+    clf_solvent = AR.get('clf_solvent')
+    sol_pred = None
+    if clf_solvent is not None:
+        try:
+            probs_s = clf_solvent.predict_proba(X)[0]
+            topi = np.argsort(probs_s)[::-1][0]
+            sol_label = AR['solvent_le'].inverse_transform([topi])[0]
+            sol_pred = None if sol_label == '<<NULL>>' else sol_label
+        except Exception:
+            sol_pred = None
+
+    # similar reactions via NN (exclude exact self-match if found)
+    similar = []
+    try:
+        # AR['nn_index'] fitted on AR['X_fp_all']
+        dists, idxs = AR['nn_index'].kneighbors(X, n_neighbors=6, return_distance=True)
+        dlist = dists[0].tolist()
+        ilist = idxs[0].tolist()
+        # iterate skipping first if distance==0 (itself)
+        for dist, i in zip(dlist, ilist):
+            row = AR['df'].iloc[i]
+            similar.append({
+                "id": str(row['id']),
+                "smiles": row['smiles'],
+                "agent": row['agent'] if row['agent'] is not None else None,
+                "solvent": row['solvent'] if row['solvent'] is not None else None,
+                "procedure_details": row['procedure_details'],
+                "temperature": float(row['temperature']) if (row['temperature'] not in (None, 'None', '') and pd_notna(row['temperature'])) else None,
+                "rxn_time": float(row['rxn_time']) if (row['rxn_time'] not in (None, 'None', '') and pd_notna(row['rxn_time'])) else None,
+                "yield": float(row['yield_percent']) if (row['yield_percent'] not in (None, 'None', '') and pd_notna(row['yield_percent'])) else None,
+                "distance": float(dist)
             })
     except Exception:
-        similar_reactions = []
+        similar = []
 
-    return {
+    result = {
         "prediction": {
-            "catalyst": catalyst,
-            "loading_mol_percent": float(round(loading, 4)),
-            "confidence": float(round(confidence, 4)),
-            "protocol_note": ""
+            "agent": agent_pred,
+            "solvent": sol_pred,
+            "confidence": agent_conf,
+            "protocol_note": similar[0]['procedure_details'] if similar and similar[0].get('procedure_details') else None
         },
         "alternatives": alternatives,
-        "similar_reactions": similar_reactions
+        "similar_reactions": similar
     }
+    return result
+
+def pd_notna(x):
+    return x is not None and str(x) != 'nan'
