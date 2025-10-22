@@ -1,116 +1,78 @@
-import pandas as pd
-import numpy as np
-import pickle
-import warnings
+import argparse
 import os
-from rdkit import RDLogger, Chem
-from rdkit.Chem import rdMolDescriptors
-from rdkit.DataStructs import ConvertToNumpyArray
-from sklearn.preprocessing import LabelEncoder
-from sklearn.ensemble import RandomForestClassifier, RandomForestRegressor
+from pathlib import Path
+import joblib
+import numpy as np
+import pandas as pd
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.neighbors import NearestNeighbors
 
-RDLogger.DisableLog('rdApp.*')
-warnings.filterwarnings("ignore", category=DeprecationWarning)
+from src.data import load_orderly_csv, featurize_df
 
-def load_dataset(csv_path):
-    df = pd.read_csv(csv_path)
-    df.columns = [c.strip().lower() for c in df.columns]
+def train(csv_path: str, out_path: str, n_estimators: int = 200):
+    print("Loading dataset..")
+    df = load_orderly_csv(csv_path)
+    print(f" Loaded {len(df)} rows")
 
-    if 'smiles' not in df.columns or 'pic50' not in df.columns:
-        raise ValueError("CSV must have 'smiles' and 'pic50' columns")
+    # filter rows that have agent (agent_000), need agent for supervised train
+    df_agent = df[df['agent'].notna() & (df['agent'].astype(str).str.strip() != '')].reset_index(drop=True)
+    print(f" Rows with agent available: {len(df_agent)}")
 
-    # Handle missing catalyst
-    if 'catalyst' not in df.columns:
-        print("  No 'catalyst' column found. Using placeholder labels.")
-        df['catalyst'] = [f"CAT_{i % 5}" for i in range(len(df))]
+    # featurize entire df (need fingerprints for retrieval over full df)
+    X_fp_all, artifacts = featurize_df(df)
+    agent_le = artifacts['agent_le']
+    solvent_le = artifacts['solvent_le']
 
-    # Replace missing pic50 values
-    if df['pic50'].isna().any():
-        mean_val = df['pic50'].mean()
-        print(f"  Found NaN in 'pic50'. Replacing with mean value ({mean_val:.2f}).")
-        df['pic50'] = df['pic50'].fillna(mean_val)
+    # build agent classifier only on rows that have agent labels (non-null)
+    idx_agent = df.index[df['agent'].notna() & (df['agent'].astype(str).str.strip() != '')].tolist()
+    if len(idx_agent) == 0:
+        raise RuntimeError("No agent labels found in dataset (agent_000). Cannot train classifier.")
 
-    df['loading'] = df.get('loading', 0.0)
-    df['solvent'] = df.get('solvent', '')
-    df['base'] = df.get('base', '')
-    df['temperature'] = df.get('temperature', 0.0)
-    df = df.dropna(subset=['smiles']).reset_index(drop=True)
-    df['id'] = df.index.astype(str)
-    return df
+    X_agent = X_fp_all[idx_agent]
+    y_agent = agent_le.transform(df.loc[idx_agent, 'agent'].fillna('<<NULL>>').astype(str).values)
 
-def mols_to_fp(mols, radius=2, nBits=512):
-    fp_arr = np.zeros((nBits,), dtype=int)
-    for mol in mols:
-        if mol is None:
-            continue
-        fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius, nBits=nBits)
-        arr = np.zeros((nBits,), dtype=int)
-        ConvertToNumpyArray(fp, arr)
-        fp_arr |= arr
-    return fp_arr
+    print("Training agent classifier (RandomForest)...")
+    clf_agent = RandomForestClassifier(n_estimators=n_estimators, n_jobs=-1, random_state=42)
+    clf_agent.fit(X_agent, y_agent)
+    print(" Agent classifier trained.")
 
-def reaction_to_fp(reaction_smiles, radius=2, nBits=512):
-    mols = [Chem.MolFromSmiles(s) for s in reaction_smiles.split('.') if s.strip()]
-    return mols_to_fp(mols, radius=radius, nBits=nBits)
+    # build solvent classifier if solvents exist
+    idx_solvent = df.index[df['solvent'].notna() & (df['solvent'].astype(str).str.strip() != '')].tolist()
+    clf_solvent = None
+    if len(idx_solvent) > 0:
+        X_solvent = X_fp_all[idx_solvent]
+        y_solvent = solvent_le.transform(df.loc[idx_solvent, 'solvent'].fillna('<<NULL>>').astype(str).values)
+        print("Training solvent classifier (RandomForest)...")
+        clf_solvent = RandomForestClassifier(n_estimators=max(50, n_estimators//4), n_jobs=-1, random_state=42)
+        clf_solvent.fit(X_solvent, y_solvent)
+        print(" Solvent classifier trained.")
+    else:
+        print("No solvent labels found; skipping solvent classifier.")
 
-def featurize(df):
-    fps = []
-    for smi in df['smiles']:
-        try:
-            fps.append(reaction_to_fp(smi))
-        except Exception:
-            fps.append(np.zeros(512, dtype=int))
-    X_fp = np.array(fps)
+    # build NearestNeighbors index for retrieval (use cosine on binary fp)
+    print("Building NearestNeighbors index for retrieval...")
+    nn = NearestNeighbors(n_neighbors=6, metric='cosine', algorithm='brute')  # 6 includes self at index 0
+    nn.fit(X_fp_all)
 
-    catalyst_le = LabelEncoder()
-    y_cat = catalyst_le.fit_transform(df['catalyst'])
-
-    sol_le = LabelEncoder()
-    base_le = LabelEncoder()
-    sol_vals = sol_le.fit_transform(df['solvent'].fillna(''))
-    base_vals = base_le.fit_transform(df['base'].fillna(''))
-    temps = df['temperature'].fillna(0.0).astype(float).values
-
-    misc = np.vstack([sol_vals, base_vals, temps]).T
-    X = np.hstack([X_fp, misc])
-
-    catalyst_to_loading = {c: np.random.uniform(0.01, 2.0) for c in catalyst_le.classes_}
-    return X, y_cat, X_fp, catalyst_le, catalyst_to_loading, sol_le, base_le
-
-if __name__ == "__main__":
-    import argparse
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--csv", default="data/SMILES_Big_Data_Set.csv")
-    parser.add_argument("--out", default="model/artifacts.pkl")
-    args = parser.parse_args()
-
-    print("Loading dataset...")
-    df = load_dataset(args.csv)
-    print(f" Loaded {len(df)} entries | {len(df['catalyst'].unique())} catalysts")
-
-    X, y_cat, X_fp, catalyst_le, catalyst_to_loading, sol_le, base_le = featurize(df)
-
-    print("Training classifier...")
-    clf = RandomForestClassifier(n_estimators=20, random_state=42, n_jobs=-1)
-    clf.fit(X, y_cat)
-
-    print("Training regressor...")
-    reg = RandomForestRegressor(n_estimators=20, random_state=42, n_jobs=-1)
-    reg.fit(X, df['pic50'].values)
-
-    artifacts = {
-        "clf": clf,
-        "reg": reg,
-        "catalyst_le": catalyst_le,
-        "sol_le": sol_le,
-        "base_le": base_le,
-        "train_fp": X_fp,
-        "train_smiles": df['smiles'].tolist(),
-        "train_catalyst": df['catalyst'].tolist(),
-        "train_loading": df['loading'].tolist()
+    # pack artifacts
+    packed = {
+        'clf_agent': clf_agent,
+        'clf_solvent': clf_solvent,
+        'agent_le': agent_le,
+        'solvent_le': solvent_le,
+        'nn_index': nn,
+        'X_fp_all': X_fp_all,
+        'df': df  # standardized df for retrieval
     }
 
-    os.makedirs(os.path.dirname(args.out), exist_ok=True)
-    with open(args.out, "wb") as f:
-        pickle.dump(artifacts, f)
-    print(f"Saved artifacts to {args.out}")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    joblib.dump(packed, out_path)
+    print(f"Saved artifacts to {out_path}")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--csv", required=True, help="Path to ORDerly-condition CSV")
+    parser.add_argument("--out", default="models/artifacts.joblib", help="Output path for artifacts")
+    parser.add_argument("--n-est", type=int, default=200, help="n_estimators for random forest")
+    args = parser.parse_args()
+    train(args.csv, args.out, n_estimators=args.n_est)
