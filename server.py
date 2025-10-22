@@ -8,9 +8,19 @@ import traceback
 import math
 import uvicorn
 
-APP = FastAPI(title="Graph Catalyst ML - API")
+from fastapi.middleware.cors import CORSMiddleware
 
-MODEL_PATH = "models/artifacts_pruned_safe.joblib"  
+APP = FastAPI(title="Catalyst ML - API (frontend-compatible)")
+
+APP.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],               
+    allow_credentials=False,          
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+MODEL_PATH = "models/artifacts_pruned_safe.joblib"
 
 class PredictRequest(BaseModel):
     smiles: str
@@ -32,9 +42,8 @@ DF = ART.get("df")
 CLF_SOLVENT = ART.get("clf_solvent", None)
 SOLVENT_LE = ART.get("solvent_le", None)
 
-# json-safe helpers 
+# json-safe helpers
 def _safe_float(x):
-    # return a json-safe float (None if NaN/Inf)
     try:
         if x is None:
             return None
@@ -44,7 +53,6 @@ def _safe_float(x):
         return None
 
 def _clean_scores(arr: np.ndarray) -> np.ndarray:
-    # replace NaN/Inf in probability arrays and renormalize if possible
     if arr is None:
         return None
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
@@ -54,7 +62,6 @@ def _clean_scores(arr: np.ndarray) -> np.ndarray:
     return arr
 
 def _json_safe(obj):
-    # recursively make an object json by cleaning floats
     if isinstance(obj, dict):
         return {k: _json_safe(v) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -69,13 +76,11 @@ def _json_safe(obj):
         return None
     return obj
 
-
 # prediction helpers
-def safe_predict_agent(fp_array: np.ndarray, topk: int = 5):
-    
-    # return list of {catalyst, score, loading_mol_percent} sorted by score desc
-    # ensures scores are finite and json-safe
-    
+def safe_predict_agent(fp_array: np.ndarray, topk: int = 5, solvent_hint: Optional[str] = None):
+    """
+    Return list of dicts with keys: catalyst, agent (alias), score, loading_mol_percent, solvent
+    """
     if CLF_AGENT is None or AGENT_LE is None:
         return []
     try:
@@ -87,37 +92,53 @@ def safe_predict_agent(fp_array: np.ndarray, topk: int = 5):
             label = AGENT_LE.inverse_transform([int(i)])[0]
             out.append({
                 "catalyst": label,
+                "agent": label,  # alias for frontend
                 "score": _safe_float(proba[i]),
-                "loading_mol_percent": None
+                "loading_mol_percent": None,
+                "solvent": solvent_hint
             })
         return out
     except Exception:
-        # allback to predict() only
         try:
             label_idx = int(CLF_AGENT.predict(fp_array.reshape(1, -1))[0])
             lab = AGENT_LE.inverse_transform([label_idx])[0]
-            return [{"catalyst": lab, "score": _safe_float(1.0), "loading_mol_percent": None}]
+            return [{
+                "catalyst": lab,
+                "agent": lab,
+                "score": _safe_float(1.0),
+                "loading_mol_percent": None,
+                "solvent": solvent_hint
+            }]
         except Exception:
             return []
 
 def nearest_similar(fp_array: np.ndarray, k: int = 5):
-    
-    # use NN index to find nearest examples, make sure output is json safe
-    
+    """
+    Return list of similar reactions with keys matching frontend: id, smiles, agent, solvent, temperature, yield
+    """
     if NN_INDEX is None or DF is None:
         return []
     try:
         dists, inds = NN_INDEX.kneighbors(fp_array.reshape(1, -1), n_neighbors=k)
-        dists = _clean_scores(dists[0])  # not probs but keep it finite; no renorm necessary
+        # make distances finite
+        dists = np.nan_to_num(dists, nan=0.0, posinf=0.0, neginf=0.0)[0]
         out = []
         for j, idx in enumerate(inds[0]):
             row = DF.iloc[int(idx)]
+            # attempt to pull fields that may exist in DF; tolerate missing names
+            agent_val = row.get("agent") if "agent" in row.index else row.get("catalyst") if "catalyst" in row.index else row.get("agent_000", None)
+            solvent_val = row.get("solvent") if "solvent" in row.index else row.get("solvent_000", None) or (row.get("solvent_prediction") if "solvent_prediction" in row.index else None)
+            temperature_val = row.get("temperature") if "temperature" in row.index else row.get("temperature_c", None) or row.get("temp", None)
+            yield_val = row.get("yield_percent") if "yield_percent" in row.index else row.get("yield_000", None) or row.get("yield", None)
             out.append({
                 "id": str(row.get("id", idx)),
-                "smiles": row.get("smiles", "") or "",
-                "catalyst": row.get("agent", "") or "",
-                "loading": _safe_float(row.get("yield_percent", None)),
-                "distance": _safe_float(dists[j] if dists is not None else None),
+                "smiles": row.get("smiles", "") or row.get("rxn_str", "") or "",
+                "agent": agent_val or "",
+                "catalyst": agent_val or "",  # alias
+                "solvent": solvent_val or "",
+                "temperature": _safe_float(temperature_val),
+                "yield": _safe_float(yield_val),
+                "distance": _safe_float(dists[j] if j < len(dists) else None)
             })
         return out
     except Exception:
@@ -140,29 +161,39 @@ def safe_predict_solvent(fp_array: np.ndarray):
         except Exception:
             return None
 
-# api
+# API endpoint
 @APP.post("/predict")
 def predict(req: PredictRequest):
     try:
-        smiles = req.smiles or ""
-        # build fingerprint matching the trained dimensionality
+        smiles = (req.smiles or "").strip()
         nbits = int(X_FP_ALL.shape[1]) if X_FP_ALL is not None else 512
         fp = reaction_to_fp(smiles, radius=2, nBits=nbits)
 
-        primary = safe_predict_agent(fp, topk=1)
-        alternatives = safe_predict_agent(fp, topk=5)
-        similar = nearest_similar(fp, k=5)
+        # get solvent hint from solvent predictor (so we can populate alternatives' solvent field)
         solvent_pred = safe_predict_solvent(fp)
+        solvent_hint = solvent_pred.get("solvent") if solvent_pred else None
+
+        primary_list = safe_predict_agent(fp, topk=1, solvent_hint=solvent_hint)
+        alternatives = safe_predict_agent(fp, topk=5, solvent_hint=solvent_hint)
+        similar = nearest_similar(fp, k=5)
+
+        primary = primary_list[0] if primary_list else None
 
         resp = {
+            # Keep old names too (catalyst) but expose frontend-friendly names (agent/solvent)
             "prediction": {
-                "catalyst": primary[0]["catalyst"] if primary else None,
-                "confidence": _safe_float(primary[0]["score"] if primary else 0.0),
-                "loading_mol_percent": _safe_float(primary[0].get("loading_mol_percent") if primary else None),
+                "catalyst": primary.get("catalyst") if primary else None,
+                "agent": primary.get("agent") if primary else None,
+                "solvent": solvent_hint,
+                "confidence": _safe_float(primary.get("score") if primary else 0.0),
+                "loading_mol_percent": _safe_float(primary.get("loading_mol_percent") if primary else None),
                 "protocol_note": ""
             },
+            # alternatives now include agent + solvent keys for frontend
             "alternatives": alternatives,
+            # similar reactions use agent, solvent, yield, temperature keys
             "similar_reactions": similar,
+            # also provide explicit solvent_prediction object (for advanced UI use)
             "solvent_prediction": solvent_pred
         }
         return _json_safe(resp)
