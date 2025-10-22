@@ -3,142 +3,172 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import joblib
 import numpy as np
-from pathlib import Path
-import pandas as pd
-
 from src.data import reaction_to_fp
+import traceback
+import math
+import uvicorn
 
-ARTIFACT_PATH = Path("models/artifacts.joblib")
+APP = FastAPI(title="Graph Catalyst ML - API")
 
-app = FastAPI(title="Graph Catalyst ML (ORDerly) - lightweight API")
-
-AR = None  # will hold artifacts dict
-
-@app.on_event("startup")
-def load_models():
-    global AR
-    if not ARTIFACT_PATH.exists():
-        raise RuntimeError(f"Artifacts not found at {ARTIFACT_PATH}. Train models first with src/train.py")
-    AR = joblib.load(str(ARTIFACT_PATH))
-    print("Loaded artifacts. Models ready.")
-    required = ['clf_agent', 'agent_le', 'nn_index', 'X_fp_all', 'df']
-    for k in required:
-        if k not in AR:
-            raise RuntimeError(f"Artifact missing required key: {k}")
-
+MODEL_PATH = "models/artifacts_pruned_safe.joblib"  
 
 class PredictRequest(BaseModel):
-    smiles: Optional[str] = None
-    product_smiles: Optional[str] = None
+    smiles: str
     solvent: Optional[str] = None
-    temperature_c: Optional[float] = None
-    rxn_time_h: Optional[float] = None
-    yield_percent: Optional[float] = None
+    base: Optional[str] = None
+    temperature: Optional[float] = None
 
+def load_artifacts(path: str):
+    data = joblib.load(path)
+    return data
 
-def _build_reaction_smiles(payload: PredictRequest) -> str:
-    if payload.smiles:
-        return payload.smiles
-    if payload.product_smiles:
-        return f">>{payload.product_smiles}"
-    return ""
+print("Loading model artifacts...")
+ART = load_artifacts(MODEL_PATH)
+CLF_AGENT = ART.get("clf_agent")
+AGENT_LE = ART.get("agent_le")
+NN_INDEX = ART.get("nn_index")
+X_FP_ALL = ART.get("X_fp_all")
+DF = ART.get("df")
+CLF_SOLVENT = ART.get("clf_solvent", None)
+SOLVENT_LE = ART.get("solvent_le", None)
 
-
-@app.post("/predict")
-def predict(payload: PredictRequest):
-    """
-    json form:
-    {
-      "prediction": { "agent": "...", "solvent": "...", "confidence": 0.82, "protocol_note": "..." },
-      "alternatives": [ { "agent": "...", "solvent": "...", "score": 0.6 }, ... ],
-      "similar_reactions": [ { "id": "...", "smiles": "...", "agent": "...", "solvent": "...", "procedure_details": "..." }, ... ]
-    }
-    """
-    global AR
-    if AR is None:
-        raise HTTPException(status_code=500, detail="Model artifacts not loaded")
-
-    rxn = _build_reaction_smiles(payload)
+# json-safe helpers 
+def _safe_float(x):
+    # return a json-safe float (None if NaN/Inf)
     try:
-        nBits = AR['X_fp_all'].shape[1]
-        fp = reaction_to_fp(rxn, nBits=nBits)
-        X = fp.reshape(1, -1)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid SMILES or fingerprint error: {e}")
-
-    # agent prediction
-    clf_agent = AR.get('clf_agent')
-    agent_le = AR.get('agent_le')
-    agent_pred = None
-    agent_conf = None
-    alternatives = []
-    if clf_agent is not None:
-        try:
-            probs = clf_agent.predict_proba(X)[0]
-            class_idxs = clf_agent.classes_
-            # get top sorted indices 
-            order = np.argsort(probs)[::-1]
-            # top class integer index
-            top_class_int = class_idxs[order[0]]
-            agent_label = agent_le.inverse_transform([top_class_int])[0]
-            agent_pred = None if agent_label == '<<NULL>>' else agent_label
-            agent_conf = float(probs[order[0]])
-            # alts top5
-            alt_list = []
-            for pos in order[:10]:
-                ci = class_idxs[pos]
-                label = agent_le.inverse_transform([ci])[0]
-                if label == '<<NULL>>':
-                    continue
-                alt_list.append({"agent": label, "score": float(probs[pos])})
-                if len(alt_list) >= 5:
-                    break
-            alternatives = alt_list
-        except Exception:
-            agent_pred = None
-
-    # solvent prediction if available
-    clf_solvent = AR.get('clf_solvent')
-    sol_pred = None
-    if clf_solvent is not None:
-        try:
-            probs_s = clf_solvent.predict_proba(X)[0]
-            class_idxs_s = clf_solvent.classes_
-            top_pos = np.argsort(probs_s)[::-1][0]
-            top_int = class_idxs_s[top_pos]
-            sol_label = AR['solvent_le'].inverse_transform([top_int])[0]
-            sol_pred = None if sol_label == '<<NULL>>' else sol_label
-        except Exception:
-            sol_pred = None
-
-    # similar reactions via NN
-    similar = []
-    try:
-        dists, idxs = AR['nn_index'].kneighbors(X, n_neighbors=6, return_distance=True)
-        for dist, i in zip(dists[0], idxs[0]):
-            row = AR['df'].iloc[int(i)]
-            similar.append({
-                "id": str(row['id']),
-                "smiles": row['smiles'],
-                "agent": row['agent'] if row['agent'] is not None else None,
-                "solvent": row['solvent'] if row['solvent'] is not None else None,
-                "procedure_details": row['procedure_details'] if 'procedure_details' in row else None,
-                "temperature": float(row['temperature']) if pd.notna(row['temperature']) and row['temperature'] not in (None, '') else None,
-                "rxn_time": float(row['rxn_time']) if pd.notna(row['rxn_time']) and row['rxn_time'] not in (None, '') else None,
-                "yield": float(row['yield_percent']) if pd.notna(row['yield_percent']) and row['yield_percent'] not in (None, '') else None,
-                "distance": float(dist)
-            })
+        if x is None:
+            return None
+        xf = float(x)
+        return xf if math.isfinite(xf) else None
     except Exception:
-        similar = []
+        return None
 
-    result = {
-        "prediction": {
-            "agent": agent_pred,
-            "solvent": sol_pred,
-            "confidence": agent_conf,
-            "protocol_note": similar[0]['procedure_details'] if similar and similar[0].get('procedure_details') else None
-        },
-        "alternatives": alternatives,
-        "similar_reactions": similar
-    }
-    return result
+def _clean_scores(arr: np.ndarray) -> np.ndarray:
+    # replace NaN/Inf in probability arrays and renormalize if possible
+    if arr is None:
+        return None
+    arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
+    s = arr.sum()
+    if s > 0:
+        arr = arr / s
+    return arr
+
+def _json_safe(obj):
+    # recursively make an object json by cleaning floats
+    if isinstance(obj, dict):
+        return {k: _json_safe(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [_json_safe(v) for v in obj]
+    if isinstance(obj, float):
+        return _safe_float(obj)
+    if isinstance(obj, np.floating):
+        return _safe_float(float(obj))
+    if isinstance(obj, np.integer):
+        return int(obj)
+    if obj is None:
+        return None
+    return obj
+
+
+# prediction helpers
+def safe_predict_agent(fp_array: np.ndarray, topk: int = 5):
+    
+    # return list of {catalyst, score, loading_mol_percent} sorted by score desc
+    # ensures scores are finite and json-safe
+    
+    if CLF_AGENT is None or AGENT_LE is None:
+        return []
+    try:
+        proba = CLF_AGENT.predict_proba(fp_array.reshape(1, -1))[0]
+        proba = _clean_scores(proba)
+        idxs = np.argsort(proba)[::-1][:topk]
+        out = []
+        for i in idxs:
+            label = AGENT_LE.inverse_transform([int(i)])[0]
+            out.append({
+                "catalyst": label,
+                "score": _safe_float(proba[i]),
+                "loading_mol_percent": None
+            })
+        return out
+    except Exception:
+        # allback to predict() only
+        try:
+            label_idx = int(CLF_AGENT.predict(fp_array.reshape(1, -1))[0])
+            lab = AGENT_LE.inverse_transform([label_idx])[0]
+            return [{"catalyst": lab, "score": _safe_float(1.0), "loading_mol_percent": None}]
+        except Exception:
+            return []
+
+def nearest_similar(fp_array: np.ndarray, k: int = 5):
+    
+    # use NN index to find nearest examples, make sure output is json safe
+    
+    if NN_INDEX is None or DF is None:
+        return []
+    try:
+        dists, inds = NN_INDEX.kneighbors(fp_array.reshape(1, -1), n_neighbors=k)
+        dists = _clean_scores(dists[0])  # not probs but keep it finite; no renorm necessary
+        out = []
+        for j, idx in enumerate(inds[0]):
+            row = DF.iloc[int(idx)]
+            out.append({
+                "id": str(row.get("id", idx)),
+                "smiles": row.get("smiles", "") or "",
+                "catalyst": row.get("agent", "") or "",
+                "loading": _safe_float(row.get("yield_percent", None)),
+                "distance": _safe_float(dists[j] if dists is not None else None),
+            })
+        return out
+    except Exception:
+        return []
+
+def safe_predict_solvent(fp_array: np.ndarray):
+    if CLF_SOLVENT is None or SOLVENT_LE is None:
+        return None
+    try:
+        proba = CLF_SOLVENT.predict_proba(fp_array.reshape(1, -1))[0]
+        proba = _clean_scores(proba)
+        idx = int(np.argmax(proba))
+        label = SOLVENT_LE.inverse_transform([idx])[0]
+        return {"solvent": label, "score": _safe_float(proba[idx])}
+    except Exception:
+        try:
+            idx = int(CLF_SOLVENT.predict(fp_array.reshape(1, -1))[0])
+            label = SOLVENT_LE.inverse_transform([idx])[0]
+            return {"solvent": label, "score": _safe_float(1.0)}
+        except Exception:
+            return None
+
+# api
+@APP.post("/predict")
+def predict(req: PredictRequest):
+    try:
+        smiles = req.smiles or ""
+        # build fingerprint matching the trained dimensionality
+        nbits = int(X_FP_ALL.shape[1]) if X_FP_ALL is not None else 512
+        fp = reaction_to_fp(smiles, radius=2, nBits=nbits)
+
+        primary = safe_predict_agent(fp, topk=1)
+        alternatives = safe_predict_agent(fp, topk=5)
+        similar = nearest_similar(fp, k=5)
+        solvent_pred = safe_predict_solvent(fp)
+
+        resp = {
+            "prediction": {
+                "catalyst": primary[0]["catalyst"] if primary else None,
+                "confidence": _safe_float(primary[0]["score"] if primary else 0.0),
+                "loading_mol_percent": _safe_float(primary[0].get("loading_mol_percent") if primary else None),
+                "protocol_note": ""
+            },
+            "alternatives": alternatives,
+            "similar_reactions": similar,
+            "solvent_prediction": solvent_pred
+        }
+        return _json_safe(resp)
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+if __name__ == "__main__":
+    uvicorn.run(APP, host="127.0.0.1", port=8000)
