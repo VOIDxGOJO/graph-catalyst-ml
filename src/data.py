@@ -1,48 +1,40 @@
 
+"""
+util for orderly dataset
+
+load_orderly_csv(path)- returns cleaned df with columns:
+  ['id','smiles','agent','solvent','temperature','rxn_time','yield_percent','procedure_details']
+
+reaction_to_fp(smiles, radius, nBits)- returns 1D numpy int8 fingerprint
+featurize_df(df, radius, nBits, show_progress)- returns (X_fp, meta)
+    X_fp- numpy array N x nBits (dtype int8)
+    meta- dict with fp params (not fitted LabelEncoders)
+"""
+
 from typing import Tuple, Dict, Any
 import pandas as pd
 import numpy as np
-import joblib
 import re
-from pathlib import Path
-
-# RDKit imports
 from rdkit import Chem, RDLogger
 from rdkit.Chem import rdMolDescriptors
 from rdkit.DataStructs import ConvertToNumpyArray
-
-from sklearn.preprocessing import LabelEncoder
 from tqdm import tqdm
 
 RDLogger.DisableLog('rdApp.*')
 
-# fingerprint defaults
+# defaults
 FP_RADIUS = 2
-FP_NBITS = 1024
+FP_NBITS = 128
 
-# regex to remove atom-mapping numbers like ":23" inside brackets [CH3:23] -> [CH3]
-_RE_ATOM_MAP = re.compile(r':\d+]')
-# remove mapping like :1] etc and mapping preceding closing bracket
 _RE_COLON_NUMBER = re.compile(r':\d+')
-# if tokens like [ClH:42] -> [ClH] ; attempt to keep bracketed element
 _RE_BRACKET_MAP = re.compile(r'\[([^\]:]+):\d+\]')
 
-
 def _strip_atom_map(s: str) -> str:
-    """
-    remove atom mapping annotations produced by some reaction formats
-    [CH3:23] -> [CH3]
-    [O:54] -> [O]
-    to keep bracket structure where possible
-    """
     if s is None:
         return s
-    # quick fast replacement regex to replace [X:123] -> [X]
     s = _RE_BRACKET_MAP.sub(r'[\1]', s)
-    # replace stray :number
     s = _RE_COLON_NUMBER.sub('', s)
     return s
-
 
 def _compose_rxn_str_from_row(r):
     if 'rxn_str' in r and pd.notna(r['rxn_str']) and str(r['rxn_str']).strip() != '':
@@ -61,7 +53,6 @@ def _compose_rxn_str_from_row(r):
         else:
             return f"{left}>>"
     return ""
-
 
 def load_orderly_csv(path: str) -> pd.DataFrame:
     df = pd.read_csv(path, dtype=str, low_memory=False)
@@ -84,13 +75,15 @@ def load_orderly_csv(path: str) -> pd.DataFrame:
         except Exception:
             return None
 
-    df['temperature'] = df.get('temperature', None)
     if 'temperature' in df.columns:
         df['temperature'] = df['temperature'].apply(lambda x: to_float_safe(x))
+    else:
+        df['temperature'] = None
 
-    df['rxn_time'] = df.get('rxn_time', None)
     if 'rxn_time' in df.columns:
         df['rxn_time'] = df['rxn_time'].apply(lambda x: to_float_safe(x))
+    else:
+        df['rxn_time'] = None
 
     if 'yield_000' in df.columns:
         df['yield_percent'] = df['yield_000'].apply(lambda x: to_float_safe(x))
@@ -98,12 +91,12 @@ def load_orderly_csv(path: str) -> pd.DataFrame:
         df['yield_percent'] = None
 
     df['procedure_details'] = df.get('procedure_details', None)
+
     keep_cols = ['id', 'smiles', 'agent', 'solvent', 'temperature', 'rxn_time', 'yield_percent', 'procedure_details']
     for c in keep_cols:
         if c not in df.columns:
             df[c] = None
     return df[keep_cols].copy()
-
 
 def mols_to_fp(mols, radius=FP_RADIUS, nBits=FP_NBITS):
     arr = np.zeros((nBits,), dtype=np.int8)
@@ -119,18 +112,11 @@ def mols_to_fp(mols, radius=FP_RADIUS, nBits=FP_NBITS):
             continue
     return arr
 
-
 def reaction_to_fp(reaction_smiles: str, radius=FP_RADIUS, nBits=FP_NBITS):
-    """
-    compute fingerprint for a reaction SMILES; clean atom-mapping before parsing
-    returns a 1D numpy array of length nBits (dtype int8)
-    """
     if not reaction_smiles or str(reaction_smiles).strip() == "":
         return np.zeros(nBits, dtype=np.int8)
     smi = str(reaction_smiles)
-    # remove atom map numbers like [CH3:23]
     smi_clean = _strip_atom_map(smi)
-    # split reactants/products heuristically
     try:
         parts = smi_clean.split('>>')
         left = parts[0] if len(parts) > 0 else ''
@@ -150,10 +136,7 @@ def reaction_to_fp(reaction_smiles: str, radius=FP_RADIUS, nBits=FP_NBITS):
     except Exception:
         return np.zeros(nBits, dtype=np.int8)
 
-
 def featurize_df(df: pd.DataFrame, radius=FP_RADIUS, nBits=FP_NBITS, show_progress: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
-    # featurize dataset- compute fingerprints for each reaction row
-    # returns X_fp (N x nBits) and artifacts dict containing label encoders and the df
     n = len(df)
     fps = np.zeros((n, nBits), dtype=np.int8)
     bad_count = 0
@@ -169,24 +152,8 @@ def featurize_df(df: pd.DataFrame, radius=FP_RADIUS, nBits=FP_NBITS, show_progre
             fps[i, :] = np.zeros((nBits,), dtype=np.int8)
     if bad_count > 0:
         print(f"Featurization: {bad_count} rows had parse/feature errors and were zeroed.")
-    agent_le = LabelEncoder()
-    agent_vals = df['agent'].fillna('<<NULL>>').astype(str).values
-    agent_le.fit(agent_vals)
-    solvent_le = LabelEncoder()
-    solvent_vals = df['solvent'].fillna('<<NULL>>').astype(str).values
-    solvent_le.fit(solvent_vals)
-    artifacts = {
-        'agent_le': agent_le,
-        'solvent_le': solvent_le,
+    meta = {
         'fp_params': {'radius': radius, 'nbits': nBits},
-        'df': df
+        'n_rows': n
     }
-    return fps, artifacts
-
-
-def save_artifacts(path: str, artifacts: dict):
-    joblib.dump(artifacts, path)
-
-
-def load_artifacts(path: str) -> dict:
-    return joblib.load(path)
+    return fps, meta
