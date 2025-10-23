@@ -3,203 +3,250 @@ from pydantic import BaseModel
 from typing import Optional, List, Dict, Any
 import joblib
 import numpy as np
-from src.data import reaction_to_fp
-import traceback
 import math
-import uvicorn
-
+import traceback
+from rdkit import Chem
+from rdkit.Chem import Draw
+from io import BytesIO
+import base64
+from contextlib import asynccontextmanager
 from fastapi.middleware.cors import CORSMiddleware
+from src.data import reaction_to_fp
 
-APP = FastAPI(title="Catalyst ML - API (frontend-compatible)")
+ARTIFACT_PATH = "models/artifacts_quick.joblib"
 
-APP.add_middleware(
+# globals to be filled at startup
+ART = None
+CLF_AGENT = None
+AGENT_LE = None
+CLF_SOLVENT = None
+SOLVENT_LE = None
+NN_INDEX = None
+X_FP_ALL = None
+DF = None
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global ART, CLF_AGENT, AGENT_LE, CLF_SOLVENT, SOLVENT_LE, NN_INDEX, X_FP_ALL, DF
+    try:
+        print("🔹 Loading artifacts from:", ARTIFACT_PATH)
+        ART = joblib.load(ARTIFACT_PATH)
+        print("  Keys in artifact:", list(ART.keys()))
+        # safe extraction without using truth-value of arrays
+        CLF_AGENT = ART.get("clf_agent", None)
+        AGENT_LE = ART.get("agent_le", None)
+        CLF_SOLVENT = ART.get("clf_solvent", None)
+        SOLVENT_LE = ART.get("solvent_le", None)
+        NN_INDEX = ART.get("nn_index", None)
+
+        # choose X_fp field
+        if "X_fp_all" in ART and ART["X_fp_all"] is not None:
+            X_FP_ALL = ART["X_fp_all"]
+            print("  Using X_fp_all (shape):", getattr(X_FP_ALL, "shape", "n/a"))
+        elif "X_fp_for_nn" in ART and ART["X_fp_for_nn"] is not None:
+            X_FP_ALL = ART["X_fp_for_nn"]
+            print("  Using X_fp_for_nn (shape):", getattr(X_FP_ALL, "shape", "n/a"))
+        else:
+            X_FP_ALL = None
+            print("  No fingerprint array (X_fp_all / X_fp_for_nn) found in artifact.")
+
+        # choose df
+        if "df" in ART and ART["df"] is not None:
+            DF = ART["df"]
+            print("  Using DF from key 'df' (len):", len(DF) if hasattr(DF, "__len__") else "n/a")
+        elif "df_for_nn" in ART and ART["df_for_nn"] is not None:
+            DF = ART["df_for_nn"]
+            print("  Using DF from key 'df_for_nn' (len):", len(DF) if hasattr(DF, "__len__") else "n/a")
+        else:
+            DF = None
+            print("  No dataframe (df / df_for_nn) found in artifact.")
+
+        print("Artifacts loaded (safe)")
+    except Exception as e:
+        print("❌ Failed to load artifacts:", e)
+        traceback.print_exc()
+        raise e
+    yield
+    print("Server shutting down..")
+
+
+app = FastAPI(title="Catalyst ML API", lifespan=lifespan)
+
+app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],               
-    allow_credentials=False,          
+    allow_origins=["*"],
+    allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-MODEL_PATH = "models/artifacts_pruned_safe.joblib"
-
 class PredictRequest(BaseModel):
-    smiles: str
+    smiles: Optional[str] = None
+    product_smiles: Optional[str] = None
     solvent: Optional[str] = None
-    base: Optional[str] = None
-    temperature: Optional[float] = None
+    temperature_c: Optional[float] = None
+    rxn_time_h: Optional[float] = None
+    yield_percent: Optional[float] = None
 
-def load_artifacts(path: str):
-    data = joblib.load(path)
-    return data
-
-print("Loading model artifacts...")
-ART = load_artifacts(MODEL_PATH)
-CLF_AGENT = ART.get("clf_agent")
-AGENT_LE = ART.get("agent_le")
-NN_INDEX = ART.get("nn_index")
-X_FP_ALL = ART.get("X_fp_all")
-DF = ART.get("df")
-CLF_SOLVENT = ART.get("clf_solvent", None)
-SOLVENT_LE = ART.get("solvent_le", None)
-
-# json-safe helpers
-def _safe_float(x):
+# helpers
+def safe_float(v):
     try:
-        if x is None:
-            return None
-        xf = float(x)
-        return xf if math.isfinite(xf) else None
+        if v is None: return None
+        f = float(v)
+        return f if math.isfinite(f) else None
     except Exception:
         return None
 
-def _clean_scores(arr: np.ndarray) -> np.ndarray:
-    if arr is None:
-        return None
+def normalize_proba(arr):
     arr = np.nan_to_num(arr, nan=0.0, posinf=0.0, neginf=0.0)
     s = arr.sum()
-    if s > 0:
-        arr = arr / s
-    return arr
+    return arr / s if s > 0 else arr
 
-def _json_safe(obj):
-    if isinstance(obj, dict):
-        return {k: _json_safe(v) for k, v in obj.items()}
-    if isinstance(obj, list):
-        return [_json_safe(v) for v in obj]
-    if isinstance(obj, float):
-        return _safe_float(obj)
-    if isinstance(obj, np.floating):
-        return _safe_float(float(obj))
-    if isinstance(obj, np.integer):
-        return int(obj)
-    if obj is None:
+def canonical_smiles(smiles):
+    if not smiles:
         return None
-    return obj
+    try:
+        m = Chem.MolFromSmiles(smiles)
+        return Chem.MolToSmiles(m, canonical=True) if m else smiles
+    except Exception:
+        return smiles
 
-# prediction helpers
-def safe_predict_agent(fp_array: np.ndarray, topk: int = 5, solvent_hint: Optional[str] = None):
-    """
-    Return list of dicts with keys: catalyst, agent (alias), score, loading_mol_percent, solvent
-    """
+def smiles_to_png_base64(smiles, size=(220,160)):
+    if not smiles:
+        return None
+    try:
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None: return None
+        img = Draw.MolToImage(mol, size=size)
+        buf = BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("utf-8")
+    except Exception:
+        return None
+
+# core prediction helpers
+def predict_agent(fp_array, topk=5, solvent_hint=None):
     if CLF_AGENT is None or AGENT_LE is None:
         return []
     try:
-        proba = CLF_AGENT.predict_proba(fp_array.reshape(1, -1))[0]
-        proba = _clean_scores(proba)
-        idxs = np.argsort(proba)[::-1][:topk]
-        out = []
-        for i in idxs:
-            label = AGENT_LE.inverse_transform([int(i)])[0]
-            out.append({
-                "catalyst": label,
-                "agent": label,  # alias for frontend
-                "score": _safe_float(proba[i]),
-                "loading_mol_percent": None,
-                "solvent": solvent_hint
-            })
-        return out
-    except Exception:
-        try:
-            label_idx = int(CLF_AGENT.predict(fp_array.reshape(1, -1))[0])
-            lab = AGENT_LE.inverse_transform([label_idx])[0]
-            return [{
-                "catalyst": lab,
-                "agent": lab,
-                "score": _safe_float(1.0),
-                "loading_mol_percent": None,
-                "solvent": solvent_hint
-            }]
-        except Exception:
-            return []
+        if hasattr(CLF_AGENT, "predict_proba"):
+            proba = normalize_proba(CLF_AGENT.predict_proba(fp_array.reshape(1, -1))[0])
+            classes = CLF_AGENT.classes_
+            top_idx = np.argsort(proba)[::-1][:topk]
+            out = []
+            for i in top_idx:
+                enc = classes[int(i)]
+                try:
+                    label = AGENT_LE.inverse_transform([int(enc)])[0]
+                except Exception:
+                    # fallback if mapping fails
+                    label = str(enc)
+                out.append({"agent": label, "score": float(proba[i]), "loading_mol_percent": None, "solvent": solvent_hint})
+            return out
+        else:
+            idx = int(CLF_AGENT.predict(fp_array.reshape(1, -1))[0])
+            label = AGENT_LE.inverse_transform([idx])[0]
+            return [{"agent": label, "score": 1.0}]
+    except Exception as e:
+        print("Agent prediction error:", e)
+        traceback.print_exc()
+        return []
 
-def nearest_similar(fp_array: np.ndarray, k: int = 5):
-    """
-    Return list of similar reactions with keys matching frontend: id, smiles, agent, solvent, temperature, yield
-    """
+def predict_solvent(fp_array):
+    if CLF_SOLVENT is None or SOLVENT_LE is None:
+        return None
+    try:
+        if hasattr(CLF_SOLVENT, "predict_proba"):
+            proba = normalize_proba(CLF_SOLVENT.predict_proba(fp_array.reshape(1, -1))[0])
+            classes = CLF_SOLVENT.classes_
+            idx = int(np.argmax(proba))
+            enc = classes[idx]
+            try:
+                label = SOLVENT_LE.inverse_transform([int(enc)])[0]
+            except Exception:
+                label = str(enc)
+            return {"solvent": label, "score": float(proba[idx])}
+        else:
+            idx = int(CLF_SOLVENT.predict(fp_array.reshape(1, -1))[0])
+            label = SOLVENT_LE.inverse_transform([idx])[0]
+            return {"solvent": label, "score": 1.0}
+    except Exception as e:
+        print("Solvent prediction error:", e)
+        traceback.print_exc()
+        return None
+
+def nearest_similar(fp_array, k=5):
     if NN_INDEX is None or DF is None:
         return []
     try:
         dists, inds = NN_INDEX.kneighbors(fp_array.reshape(1, -1), n_neighbors=k)
-        # make distances finite
-        dists = np.nan_to_num(dists, nan=0.0, posinf=0.0, neginf=0.0)[0]
         out = []
         for j, idx in enumerate(inds[0]):
-            row = DF.iloc[int(idx)]
-            # attempt to pull fields that may exist in DF; tolerate missing names
-            agent_val = row.get("agent") if "agent" in row.index else row.get("catalyst") if "catalyst" in row.index else row.get("agent_000", None)
-            solvent_val = row.get("solvent") if "solvent" in row.index else row.get("solvent_000", None) or (row.get("solvent_prediction") if "solvent_prediction" in row.index else None)
-            temperature_val = row.get("temperature") if "temperature" in row.index else row.get("temperature_c", None) or row.get("temp", None)
-            yield_val = row.get("yield_percent") if "yield_percent" in row.index else row.get("yield_000", None) or row.get("yield", None)
+            r = DF.iloc[int(idx)]
             out.append({
-                "id": str(row.get("id", idx)),
-                "smiles": row.get("smiles", "") or row.get("rxn_str", "") or "",
-                "agent": agent_val or "",
-                "catalyst": agent_val or "",  # alias
-                "solvent": solvent_val or "",
-                "temperature": _safe_float(temperature_val),
-                "yield": _safe_float(yield_val),
-                "distance": _safe_float(dists[j] if j < len(dists) else None)
+                "id": str(r.get("id", idx)),
+                "smiles": r.get("smiles", "") or r.get("rxn_str", ""),
+                "agent": r.get("agent", "") or r.get("agent_000", ""),
+                "solvent": r.get("solvent", "") or r.get("solvent_000", ""),
+                "temperature": safe_float(r.get("temperature")),
+                "yield": safe_float(r.get("yield_percent") or r.get("yield_000")),
+                "distance": float(dists[0][j]) if (dists is not None and len(dists) and j < len(dists[0])) else None
             })
         return out
-    except Exception:
+    except Exception as e:
+        print("Nearest-neighbor error:", e)
+        traceback.print_exc()
         return []
 
-def safe_predict_solvent(fp_array: np.ndarray):
-    if CLF_SOLVENT is None or SOLVENT_LE is None:
-        return None
-    try:
-        proba = CLF_SOLVENT.predict_proba(fp_array.reshape(1, -1))[0]
-        proba = _clean_scores(proba)
-        idx = int(np.argmax(proba))
-        label = SOLVENT_LE.inverse_transform([idx])[0]
-        return {"solvent": label, "score": _safe_float(proba[idx])}
-    except Exception:
-        try:
-            idx = int(CLF_SOLVENT.predict(fp_array.reshape(1, -1))[0])
-            label = SOLVENT_LE.inverse_transform([idx])[0]
-            return {"solvent": label, "score": _safe_float(1.0)}
-        except Exception:
-            return None
-
-# API endpoint
-@APP.post("/predict")
+# endpoint
+@app.post("/predict")
 def predict(req: PredictRequest):
     try:
         smiles = (req.smiles or "").strip()
-        nbits = int(X_FP_ALL.shape[1]) if X_FP_ALL is not None else 512
+        if not smiles:
+            raise HTTPException(status_code=400, detail="Missing SMILES string")
+
+        nbits = int(X_FP_ALL.shape[1]) if (X_FP_ALL is not None and hasattr(X_FP_ALL, "shape")) else 256
         fp = reaction_to_fp(smiles, radius=2, nBits=nbits)
 
-        # get solvent hint from solvent predictor (so we can populate alternatives' solvent field)
-        solvent_pred = safe_predict_solvent(fp)
+        solvent_pred = predict_solvent(fp)
         solvent_hint = solvent_pred.get("solvent") if solvent_pred else None
+        agents = predict_agent(fp, topk=5, solvent_hint=solvent_hint)
 
-        primary_list = safe_predict_agent(fp, topk=1, solvent_hint=solvent_hint)
-        alternatives = safe_predict_agent(fp, topk=5, solvent_hint=solvent_hint)
-        similar = nearest_similar(fp, k=5)
+        primary = agents[0] if agents else None
+        alternatives = agents[1:] if len(agents) > 1 else []
+        similar = nearest_similar(fp)
 
-        primary = primary_list[0] if primary_list else None
+        agent_smiles = primary.get("agent") if primary else None
+        solvent_smiles = solvent_hint
 
-        resp = {
-            # Keep old names too (catalyst) but expose frontend-friendly names (agent/solvent)
+        agent_cano = canonical_smiles(agent_smiles)
+        solvent_cano = canonical_smiles(solvent_smiles)
+        agent_img = smiles_to_png_base64(agent_smiles)
+        solvent_img = smiles_to_png_base64(solvent_smiles)
+
+        return {
             "prediction": {
-                "catalyst": primary.get("catalyst") if primary else None,
-                "agent": primary.get("agent") if primary else None,
-                "solvent": solvent_hint,
-                "confidence": _safe_float(primary.get("score") if primary else 0.0),
-                "loading_mol_percent": _safe_float(primary.get("loading_mol_percent") if primary else None),
-                "protocol_note": ""
+                "agent": agent_smiles,
+                "agent_smiles": agent_smiles,
+                "agent_smiles_canonical": agent_cano,
+                "agent_img": agent_img,
+                "solvent": solvent_smiles,
+                "solvent_smiles": solvent_smiles,
+                "solvent_smiles_canonical": solvent_cano,
+                "solvent_img": solvent_img,
+                "confidence": safe_float(primary.get("score") if primary else 0.0)
             },
-            # alternatives now include agent + solvent keys for frontend
             "alternatives": alternatives,
-            # similar reactions use agent, solvent, yield, temperature keys
             "similar_reactions": similar,
-            # also provide explicit solvent_prediction object (for advanced UI use)
             "solvent_prediction": solvent_pred
         }
-        return _json_safe(resp)
+
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
 
+
 if __name__ == "__main__":
-    uvicorn.run(APP, host="127.0.0.1", port=8000)
+    import uvicorn
+    uvicorn.run(app, host="127.0.0.1", port=8000)

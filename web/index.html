@@ -4,9 +4,8 @@
 <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width,initial-scale=1" />
-    <title>Graph Catalyst ML: ORDerly (agent & solvent)</title>
-    <meta name="description"
-        content="Predict agent (catalyst/agent) and solvent from reaction SMILES (ORDerly-condition)" />
+    <title>Graph Catalyst ML</title>
+    <meta name="description" content="Predict catalyst and loading (mol %) for organic reactions" />
     <link rel="stylesheet" href="./styles.css" />
 </head>
 
@@ -19,7 +18,7 @@
                 </svg>
                 <div>
                     <h1>Graph Catalyst ML</h1>
-                    <p class="muted">Conservative: predict agent (catalyst/agent) & solvent from ORDerly-condition</p>
+                    <p class="muted">Catalyst (agent) + solvent recommender (visual)</p>
                 </div>
             </div>
             <nav class="nav">
@@ -30,43 +29,34 @@
         <main class="container">
             <section class="left-pane">
                 <form id="predict-form" class="card form-card" autocomplete="off" aria-labelledby="form-title">
-                    <h2 id="form-title">Reaction input (what we actually use)</h2>
-
+                    <h2 id="form-title">Reaction input (SMILES reactants.reagents&gt;&gt;product)</h2>
                     <label class="field">
-                        <span class="label-text">Reaction SMILES (reactants.reagents>>product)</span>
+                        <span class="label-text">Reaction SMILES</span>
                         <textarea id="smiles" name="smiles" placeholder="e.g. BrC1=CC=CC=C1.B(O)O>>Biphenyl" rows="3"
                             required></textarea>
-                        <small class="hint">ORDerly-condition works best when reactants + product are present. Product
-                            SMILES field below is optional but helpful.</small>
+                        <small class="hint">ORDerly-condition works best when reactants + product present. Product is
+                            optional.</small>
                     </label>
 
                     <label class="field">
                         <span class="label-text">Product SMILES (optional)</span>
-                        <input id="product" name="product" placeholder="product SMILES (if known)" />
+                        <input id="product" name="product" placeholder="Product SMILES" />
                     </label>
 
                     <div class="row">
-                        <label class="field small">
-                            <span class="label-text">Temperature (°C) (optional)</span>
-                            <input id="temp" name="temp" placeholder="e.g. 25" inputmode="numeric" />
-                        </label>
-
-                        <label class="field small">
-                            <span class="label-text">Reaction time (h) (optional)</span>
-                            <input id="rxn_time" name="rxn_time" placeholder="e.g. 1" inputmode="numeric" />
-                        </label>
-
-                        <label class="field small">
-                            <span class="label-text">Yield (%) (optional)</span>
-                            <input id="yield" name="yield" placeholder="e.g. 75" inputmode="numeric" />
-                        </label>
+                        <label class="field small"><span class="label-text">Temperature (°C)</span><input id="temp"
+                                name="temp" placeholder="e.g. 25" inputmode="numeric" /></label>
+                        <label class="field small"><span class="label-text">Reaction time (h)</span><input id="rxn_time"
+                                name="rxn_time" placeholder="e.g. 0.75" /></label>
+                        <label class="field small"><span class="label-text">Yield (%)</span><input id="yield"
+                                name="yield" placeholder="e.g. 75" inputmode="numeric" /></label>
                     </div>
 
                     <div class="actions">
                         <button type="submit" id="run-btn" class="btn primary">Predict (Agent & Solvent)</button>
                         <button type="button" id="clear-btn" class="btn ghost">Clear</button>
                         <div class="spacer"></div>
-                        <div id="status-area" aria-live="polite" class="muted-small"></div>
+                        <div id="status-area" aria-live="polite"></div>
                     </div>
 
                     <div class="samples">
@@ -76,18 +66,13 @@
                 </form>
 
                 <section class="card info-card">
-                    <h3>What this app predicts</h3>
+                    <h3>How it works</h3>
+                    <p class="muted">This UI sends your reaction to the model server and shows predicted agent and
+                        solvent as structures and SMILES.</p>
                     <ul class="notes">
-                        <li><strong>Agent (agent_000):</strong> primary target (catalyst/base/agent). This is the field
-                            we can realistically predict.</li>
-                        <li><strong>Solvent (solvent_000):</strong> predicted as a separate target.</li>
-                        <li><strong>Optional / low confidence:</strong> temperature, reaction time, yield (only if
-                            dataset contains them; model quality will vary).</li>
-                        <li><strong>Not available:</strong> catalyst loading (mol %): the dataset does not contain a
-                            standardized loading column.</li>
+                        <li>Backend: <code>POST /predict</code> (FastAPI)</li>
+                        <li>Output: agent (SMILES), agent image, solvent (SMILES), solvent image.</li>
                     </ul>
-                    <p class="muted">Backend: <code>POST /predict</code>. Expected output JSON schema is described in
-                        the code.</p>
                 </section>
             </section>
 
@@ -106,32 +91,26 @@
                             <svg class="placeholder-gear" viewBox="0 0 24 24">
                                 <path fill="currentColor" d="M12 8a4 4 0 100 8 4 4 0 000-8z"></path>
                             </svg>
-                            <p class="muted">Run a prediction to see agent & solvent here.</p>
+                            <p class="muted">Run a prediction to see results here.</p>
                         </div>
                     </div>
 
                     <div id="alternatives" class="alternatives" aria-hidden="true"></div>
 
                     <details id="similar-panel" class="similar-panel" aria-hidden="true">
-                        <summary>Nearest similar reactions (retrieval)</summary>
+                        <summary>Nearest similar reactions</summary>
                         <div id="similar-list" class="similar-list"></div>
                     </details>
-                </section>
-
-                <section class="card">
-                    <h3>Activity log</h3>
-                    <div id="log-entries" class="log-entries"></div>
                 </section>
             </aside>
         </main>
 
         <footer class="footer">
-            <span class="muted">Expects POST http://127.0.0.1:8000/predict · will predict agent & solvent
-                reliably</span>
+            <span class="muted">Expects POST http://127.0.0.1:8000/predict · v0.2</span>
         </footer>
     </div>
 
-    <script type="module" src="./script.js"></script>
+    <script src="./script.js" type="module"></script>
 </body>
 
 </html>

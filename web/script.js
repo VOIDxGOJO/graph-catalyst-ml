@@ -1,25 +1,3 @@
-// fe expects backend POST /predict to return this structure:
-// {
-//   prediction: {
-//     agent: "Pd(PPh3)4",              // top predicted agent (string): primary target
-//     solvent: "THF",                 // predicted solvent (string)
-//     confidence: 0.82,               // overall confidence (0..1) - optional
-//     protocol_note: "retrieved from similar" // optional short note
-//     temperature_pred: 25,           // optional numeric (if model returns it)
-//     rxn_time_pred: 1.5,             // optional numeric (hours)
-//     yield_pred: 78.0                // optional numeric (percent)
-//   },
-//   alternatives: [
-//     { agent: "...", solvent: "...", score: 0.6 }
-//   ],
-//   similar_reactions: [
-//     { id: "461496", smiles: "...", agent: "[Pt]", solvent: "CCO", rxn_time: 0.73, temperature: 67.9, yield: 67.9 }
-//   ]
-// }
-//
-// IMP: fe only relies on agent and solvent as guaranteed outputs
-// temperature, rxn_time, yield may be empty or missing in many rows (low confidence)
-
 const API_ENDPOINT = "http://127.0.0.1:8000/predict";
 
 const form = document.getElementById("predict-form");
@@ -33,7 +11,6 @@ const mainResult = document.getElementById("main-result");
 const alternativesEl = document.getElementById("alternatives");
 const similarPanel = document.getElementById("similar-panel");
 const similarList = document.getElementById("similar-list");
-const logEntries = document.getElementById("log-entries");
 const statusArea = document.getElementById("status-area");
 
 const demoBtn = document.getElementById("demo-btn");
@@ -58,14 +35,6 @@ const SAMPLES = [
         solvent: "DMA",
         temp: "25",
         rxn_time: "1"
-    },
-    {
-        label: "SN2 (NaH alkylation)",
-        smiles: "Oc1cccc(C(F)(F)F)n1.CC(C)(C)CBr>>CC(C)(C)COc1cccc(C(F)(F)F)n1",
-        product: "CC(C)(C)COc1cccc(C(F)(F)F)n1",
-        solvent: "DMF",
-        temp: "100",
-        rxn_time: "overnight"
     }
 ];
 
@@ -89,7 +58,9 @@ function initSamples() {
 function log(msg) {
     const line = document.createElement('div');
     line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
-    logEntries.prepend(line);
+    // put at top if log exists
+    const existing = document.querySelector('.log-entries');
+    if (existing) existing.prepend(line);
 }
 
 function setStatus(txt, isError = false) {
@@ -116,7 +87,7 @@ clearBtn.addEventListener('click', () => {
     tempInput.value = "";
     rxnTimeInput.value = "";
     yieldInput.value = "";
-    mainResult.innerHTML = `<div class="placeholder"><p class="muted">Run a prediction to see agent & solvent here.</p></div>`;
+    mainResult.innerHTML = `<div class="placeholder"><p class="muted">Run a prediction to see results here.</p></div>`;
     alternativesEl.innerHTML = "";
     similarList.innerHTML = "";
     resultCard.setAttribute('aria-hidden', 'true');
@@ -150,8 +121,8 @@ async function runPrediction(payload) {
         renderPrediction(pred);
         renderAlternatives(alts);
         renderSimilar(similar);
-        setStatus("Prediction complete (agent & solvent are the primary outputs)");
-        log(`Predicted agent: ${pred.agent ?? "N/A"}, solvent: ${pred.solvent ?? "N/A"}`);
+        setStatus("Prediction complete (agent & solvent shown).");
+        log(`Predicted agent: ${pred.agent_smiles ?? pred.agent ?? "N/A"}`);
     } catch (err) {
         console.error(err);
         setStatus("Server unreachable or error. Use demo.", true);
@@ -160,30 +131,56 @@ async function runPrediction(payload) {
 }
 
 function renderPrediction(pred) {
-    // use agent and solvent as guaranteed fields
-    const agent = escapeHtml(pred.agent ?? "N/A");
-    const solvent = escapeHtml(pred.solvent ?? "N/A");
+    // agent and solvent (prefer canonical if present)
+    const agent_smiles = pred.agent_smiles || pred.agent || pred.catalyst || "N/A";
+    const agent_cano = pred.agent_smiles_canonical || agent_smiles;
+    const solvent_smiles = pred.solvent_smiles || pred.solvent || (pred.solvent_prediction && pred.solvent_prediction.solvent) || "N/A";
+    const solvent_cano = pred.solvent_smiles_canonical || solvent_smiles;
     const conf = (typeof pred.confidence === 'number') ? Math.round(pred.confidence * 100) + "%" : "N/A";
-    const note = escapeHtml(pred.protocol_note || "");
-    const tempPred = (pred.temperature_pred !== undefined && pred.temperature_pred !== null) ? `${pred.temperature_pred} °C` : "N/A";
-    const timePred = (pred.rxn_time_pred !== undefined && pred.rxn_time_pred !== null) ? `${pred.rxn_time_pred} h` : "N/A";
-    const yieldPred = (pred.yield_pred !== undefined && pred.yield_pred !== null) ? `${pred.yield_pred}%` : "N/A";
+    const note = pred.protocol_note || "";
 
+    // images base64
+    const agent_img = pred.agent_img || null;
+    const solvent_img = pred.solvent_img || null;
+
+    // main block for text + images
     mainResult.innerHTML = `
-    <div class="prediction">
-      <div class="pred-left">
-        <div class="pred-agent">${agent}</div>
-        <div class="pred-confidence">Confidence: ${conf}</div>
-        <div class="muted small">${note}</div>
+      <div class="prediction">
+        <div class="pred-left">
+          <div class="pred-agent">${escapeHtml(agent_cano)}</div>
+          <div class="pred-confidence">Confidence: ${conf}</div>
+          <div class="muted small">${escapeHtml(note)}</div>
+          <div style="margin-top:8px;font-size:13px;color:var(--muted)">SMILES: <span id="agent-smiles">${escapeHtml(agent_smiles)}</span>
+            <button id="copy-agent" class="btn tiny" style="margin-left:8px">Copy SMILES</button>
+          </div>
+        </div>
+
+        <div class="pred-right">
+          <div class="pred-solvent">${escapeHtml(solvent_cano)}</div>
+          <div class="muted small">Predicted solvent</div>
+          <div style="margin-top:8px;font-size:13px;color:var(--muted)">T: N/A · time: N/A · yield: N/A</div>
+        </div>
       </div>
-      <div class="pred-right">
-        <div class="pred-solvent">${solvent}</div>
-        <div class="muted small">Predicted solvent</div>
-        <div style="margin-top:8px;font-size:13px;color:var(--muted)">T: ${tempPred} · time: ${timePred} · yield: ${yieldPred}</div>
+      <div class="structure-row">
+        <div class="structure-card">
+          ${agent_img ? `<img id="agent-img" src="data:image/png;base64,${agent_img}" alt="Agent structure" />` : `<div style="width:160px;height:120px;display:flex;align-items:center;justify-content:center;color:var(--muted)">No image</div>`}
+          <div style="font-size:13px;color:var(--muted);max-width:220px;word-break:break-word">${escapeHtml(agent_cano)}</div>
+        </div>
+        <div class="structure-card">
+          ${solvent_img ? `<img id="solvent-img" src="data:image/png;base64,${solvent_img}" alt="Solvent structure" />` : `<div style="width:160px;height:120px;display:flex;align-items:center;justify-content:center;color:var(--muted)">No image</div>`}
+          <div style="font-size:13px;color:var(--muted);max-width:220px;word-break:break-word">${escapeHtml(solvent_cano)}</div>
+        </div>
       </div>
-    </div>
-  `;
+    `;
     resultCard.removeAttribute('aria-hidden');
+
+    // wire copy button
+    const copyBtnAgent = document.getElementById('copy-agent');
+    if (copyBtnAgent) {
+        copyBtnAgent.onclick = () => {
+            navigator.clipboard?.writeText(agent_smiles).then(() => log("Copied agent SMILES")).catch(() => log("Copy failed"));
+        };
+    }
 }
 
 function renderAlternatives(list) {
@@ -191,14 +188,14 @@ function renderAlternatives(list) {
     if (!list || !list.length) return;
     alternativesEl.innerHTML = `<h4>Top alternatives</h4>`;
     list.forEach(a => {
-        const score = Math.round((a.score || 0.5) * 100);
-        const agent = escapeHtml(a.agent || 'N/A');
-        const solvent = escapeHtml(a.solvent || '-');
+        const score = Math.round((a.score || 0.0) * 100);
+        const agent = a.agent || a.catalyst || "N/A";
+        const solvent = a.solvent || a.solvent_smiles || "-";
         alternativesEl.innerHTML += `
       <div class="alt-item">
-        <div style="width:140px">${agent}</div>
+        <div style="width:140px; font-family: monospace;">${escapeHtml(agent)}</div>
         <div class="alt-bar"><div class="alt-bar-fill" style="width:${score}%"></div></div>
-        <div style="min-width:80px;text-align:right">${solvent}</div>
+        <div style="min-width:80px;text-align:right">${escapeHtml(solvent)}</div>
       </div>`;
     });
 }
@@ -211,16 +208,16 @@ function renderSimilar(list) {
     }
     similarPanel.removeAttribute('aria-hidden');
     list.forEach(s => {
-        const id = escapeHtml(s.id || "RXN");
-        const smiles = escapeHtml(s.smiles || "");
-        const agent = escapeHtml(s.agent || "");
-        const solvent = escapeHtml(s.solvent || "");
+        const id = s.id || "RXN";
+        const smiles = s.smiles || "";
+        const agent = s.agent || s.catalyst || "";
+        const solvent = s.solvent || "";
         const yr = (s.yield !== undefined && s.yield !== null) ? `${s.yield}%` : "";
         const t = (s.temperature !== undefined && s.temperature !== null) ? `${s.temperature}°C` : "";
         similarList.innerHTML += `
       <div class="similar-item">
-        <div style="max-width:70%"><strong>${id}</strong><div class="muted" style="font-size:12px;word-break:break-word">${smiles}</div></div>
-        <div style="text-align:right"><strong>${agent}</strong><div class="muted" style="font-size:12px">${solvent}${t ? ' · ' + t : ''}${yr ? ' · yield ' + yr : ''}</div></div>
+        <div style="max-width:70%"><strong>${escapeHtml(id)}</strong><div class="muted" style="font-size:12px;word-break:break-word">${escapeHtml(smiles)}</div></div>
+        <div style="text-align:right"><strong>${escapeHtml(agent)}</strong><div class="muted" style="font-size:12px">${escapeHtml(solvent)}${t ? ' · ' + t : ''}${yr ? ' · yield ' + yr : ''}</div></div>
       </div>`;
     });
 }
@@ -229,23 +226,23 @@ async function runMockPrediction() {
     setStatus("Demo prediction (no server): conservative outputs only");
     const mock = {
         prediction: {
-            agent: "[Pt] (Pt on charcoal)",
+            agent: "[Pt]",
+            agent_smiles: "Clc1ccc(Cl)cc1Cl", // demo SMILES
+            agent_smiles_canonical: "Clc1ccc(Cl)cc1Cl",
+            agent_img: null,
             solvent: "CCO",
+            solvent_img: null,
             confidence: 0.78,
-            protocol_note: "Retrieved from similar literature example",
-            temperature_pred: 25,
-            rxn_time_pred: 0.73,
-            yield_pred: 67.9
+            protocol_note: "Demo"
         },
         alternatives: [
-            { agent: "Pd(PPh3)4", solvent: "THF", score: 0.62 },
-            { agent: "Pd2(dba)3", solvent: "DMA", score: 0.45 }
+            { agent: "Pd(PPh3)4", score: 0.62, solvent: "THF" },
+            { agent: "Pd2(dba)3", score: 0.45, solvent: "DMA" }
         ],
         similar_reactions: [
             { id: "439257", smiles: "CC(=O)c1cc...>>...", agent: "[Pt]", solvent: "CCO", temperature: 25, rxn_time: 0.73, yield: 67.9 }
         ]
     };
-
     await new Promise(r => setTimeout(r, 400));
     renderPrediction(mock.prediction);
     renderAlternatives(mock.alternatives);
@@ -255,7 +252,7 @@ async function runMockPrediction() {
 }
 
 copyBtn.addEventListener('click', () => {
-    const txt = mainResult.innerText || "";
+    const txt = (mainResult.innerText || "").trim();
     if (!navigator.clipboard) { log("Clipboard not available"); return; }
     navigator.clipboard.writeText(txt).then(() => log("Copied prediction to clipboard")).catch(() => log("Copy failed"));
 });
@@ -274,11 +271,10 @@ downloadBtn.addEventListener('click', () => {
     log("Downloaded prediction.json");
 });
 
-// escape to avoid putting arbitrary text
 function escapeHtml(unsafe) {
     if (unsafe === null || unsafe === undefined) return "";
     return String(unsafe).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#039;");
 }
 
 initSamples();
-log("Frontend ready: conservative (agent + solvent only).");
+log("Frontend ready: images + canonical SMILES supported.");
