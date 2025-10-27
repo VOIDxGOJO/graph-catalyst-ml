@@ -1,60 +1,39 @@
-import sys, os
+"""
+inspect saved model artifact and print summary of label classes.
+Run- python scripts/inspect_artifact.py {path_to_artifact}
+"""
+
+import sys
 from pathlib import Path
-here = Path(__file__).resolve().parent
-repo_root = here.parent
-if str(repo_root) not in sys.path:
-    sys.path.insert(0, str(repo_root))
+import joblib
 
-import joblib, numpy as np
-from src.data import reaction_to_fp
+def main():
+    path = Path(sys.argv[1]) if len(sys.argv) > 1 else Path("./models/artifacts_balanced2.joblib")
+    if not path.exists():
+        print("Artifact not found at", path)
+        sys.exit(2)
+    a = joblib.load(str(path))
+    print("Artifact keys:", list(a.keys()))
+    le = a.get("agent_le")
+    clf = a.get("clf_agent")
+    if le is None:
+        print("No 'agent_le' found in artifact.")
+        sys.exit(0)
+    classes = list(le.classes_)
+    print("Total agent classes:", len(classes))
+    print("\nFirst 80 classes (or fewer):")
+    for i, c in enumerate(classes[:80]):
+        print(f"{i:03d}: {c}")
 
-ART_PATH = "models/artifacts_sgd.joblib"
-if not Path(ART_PATH).exists():
-    alt = "models/artifacts_forest.joblib"
-    if Path(alt).exists():
-        ART_PATH = alt
+    # heuristics to find smiles-like labels
+    smile_like = [c for c in classes if ('[' in str(c) or (any(ch in str(c) for ch in 'CNOPS') and '(' in str(c)))]
+    if smile_like:
+        print("\nSample labels that look like SMILES/molecular strings (heuristic):")
+        for s in smile_like[:40]:
+            print(" -", s)
     else:
-        print("Artifact not found; adjust path at top of this script.")
-        raise SystemExit(1)
+        print("\nNo obviously SMILES-like labels detected by heuristic.")
+    print("\nDone.")
 
-print("Loading artifact:", ART_PATH)
-art = joblib.load(ART_PATH)
-print("Artifact keys:", list(art.keys()))
-clf = art.get("clf_agent")
-agent_le = art.get("agent_le")
-
-print("Classifier type:", type(clf))
-print("Has predict_proba:", hasattr(clf, "predict_proba"))
-if agent_le is not None:
-    try:
-        print("Agent classes:", len(agent_le.classes_))
-    except Exception as e:
-        print("Could not read agent_le:", e)
-
-SAMPLES = [
-    "Nc1ccc(O)cc1F.CC(C)([O-])[K+].Cl>>COc1cc(Cl)ccn1",
-    "CC(=O)c1cc(C)cc([N+](=O)[O-])c1O>>CC(=O)c1cc(C)cc(N)c1O"
-]
-nbits = art.get("meta", {}).get("fp_params", {}).get("nbits", 128)
-for s in SAMPLES:
-    print("\nSMILES:", s)
-    fp = reaction_to_fp(s, radius=2, nBits=nbits)
-    print("nonzero bits:", int((np.asarray(fp) != 0).sum()))
-    if clf is not None:
-        X = np.asarray(fp, dtype=float).reshape(1,-1)
-        try:
-            if hasattr(clf, "predict_proba"):
-                probs = clf.predict_proba(X)[0]
-                order = np.argsort(probs)[::-1][:5]
-                for i in order:
-                    enc = clf.classes_[int(i)]
-                    try:
-                        lab = agent_le.inverse_transform([int(enc)])[0]
-                    except Exception:
-                        lab = str(enc)
-                    print(f" {lab} -> {probs[i]:.3f}")
-            else:
-                p = clf.predict(X)[0]
-                print("pred:", p)
-        except Exception as e:
-            print("Prediction error:", e)
+if __name__ == "__main__":
+    main()

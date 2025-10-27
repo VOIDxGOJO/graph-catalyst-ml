@@ -15,7 +15,7 @@ def write_text(path: Path, txt: str):
 
 def evaluate(artifacts_path: str, out_dir: str, topk: int = 5):
     AR = load_artifacts(artifacts_path)
-    df_all = AR['df']  # combined train+test as produced by src.train
+    df_all = AR['df']  
     X_fp_all = AR['X_fp_all']
     clf_agent = AR.get('clf_agent')
     agent_le = AR.get('agent_le')

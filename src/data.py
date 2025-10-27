@@ -1,159 +1,141 @@
-
 """
-util for orderly dataset
+featurizer utils for reaction smiles
 
-load_orderly_csv(path)- returns cleaned df with columns:
-  ['id','smiles','agent','solvent','temperature','rxn_time','yield_percent','procedure_details']
 
-reaction_to_fp(smiles, radius, nBits)- returns 1D numpy int8 fingerprint
-featurize_df(df, radius, nBits, show_progress)- returns (X_fp, meta)
-    X_fp- numpy array N x nBits (dtype int8)
-    meta- dict with fp params (not fitted LabelEncoders)
+atom mapping removal and light cleaning
+fragment-level LRU cache for Morgan fingerprints (huge speed up if many repeated fragments)
+skip extremely long fragments cheaply
+returns numpy float32 array of bits (shape (nBits,))
 """
 
-from typing import Tuple, Dict, Any
-import pandas as pd
-import numpy as np
+from rdkit import Chem
+from rdkit.Chem import AllChem, DataStructs
+from rdkit import RDLogger
 import re
-from rdkit import Chem, RDLogger
-from rdkit.Chem import rdMolDescriptors
-from rdkit.DataStructs import ConvertToNumpyArray
-from tqdm import tqdm
+import numpy as np
+from functools import lru_cache
 
+# disable rdkit warnings
 RDLogger.DisableLog('rdApp.*')
 
-# defaults
-FP_RADIUS = 2
-FP_NBITS = 128
+# regexes
+RE_ATOM_MAP = re.compile(r':\d+')            # [C:1] or :1 mapping
+RE_BRACKETED_EMPTY = re.compile(r'\[ *\]')  # empty brackets
+RE_NON_PRINT = re.compile(r'[^\x20-\x7E]')  # non printable
+RE_KEEP = re.compile(r'[^0-9a-zA-Z\+\-\(\)\.\[\]\=\#@:/,]')  # allowedish chars
 
-_RE_COLON_NUMBER = re.compile(r':\d+')
-_RE_BRACKET_MAP = re.compile(r'\[([^\]:]+):\d+\]')
+# safety limits
+MAX_FRAGMENT_LENGTH = 400   # skip
+MAX_TOTAL_FRAGMENTS = 40    # if >40 fragments, skip heavy parsing and return zero vector
 
-def _strip_atom_map(s: str) -> str:
-    if s is None:
-        return s
-    s = _RE_BRACKET_MAP.sub(r'[\1]', s)
-    s = _RE_COLON_NUMBER.sub('', s)
-    return s
-
-def _compose_rxn_str_from_row(r):
-    if 'rxn_str' in r and pd.notna(r['rxn_str']) and str(r['rxn_str']).strip() != '':
-        return str(r['rxn_str'])
-    reactants = []
-    for c in ['reactant_000', 'reactant_001', 'reactant_002']:
-        if c in r and pd.notna(r[c]) and str(r[c]).strip() != '':
-            reactants.append(str(r[c]).strip())
-    product = None
-    if 'product_000' in r and pd.notna(r['product_000']) and str(r['product_000']).strip() != '':
-        product = str(r['product_000']).strip()
-    if reactants:
-        left = '.'.join(reactants)
-        if product:
-            return f"{left}>>{product}"
-        else:
-            return f"{left}>>"
-    return ""
-
-def load_orderly_csv(path: str) -> pd.DataFrame:
-    df = pd.read_csv(path, dtype=str, low_memory=False)
-    df.columns = [c.strip().lower() for c in df.columns]
-    df['id'] = df.get('index', pd.Series(range(len(df)))).astype(str)
-    df['smiles'] = df.apply(_compose_rxn_str_from_row, axis=1)
-
-    df['agent'] = df.get('agent_000', pd.NA)
-    df['agent'] = df['agent'].replace('\\N', pd.NA)
-    df['agent'] = df['agent'].where(df['agent'].notna(), None)
-
-    df['solvent'] = df.get('solvent_000', pd.NA)
-    df['solvent'] = df['solvent'].replace('\\N', pd.NA)
-    df['solvent'] = df['solvent'].where(df['solvent'].notna(), None)
-
-    def to_float_safe(x):
-        try:
-            if pd.isna(x): return None
-            return float(x)
-        except Exception:
-            return None
-
-    if 'temperature' in df.columns:
-        df['temperature'] = df['temperature'].apply(lambda x: to_float_safe(x))
-    else:
-        df['temperature'] = None
-
-    if 'rxn_time' in df.columns:
-        df['rxn_time'] = df['rxn_time'].apply(lambda x: to_float_safe(x))
-    else:
-        df['rxn_time'] = None
-
-    if 'yield_000' in df.columns:
-        df['yield_percent'] = df['yield_000'].apply(lambda x: to_float_safe(x))
-    else:
-        df['yield_percent'] = None
-
-    df['procedure_details'] = df.get('procedure_details', None)
-
-    keep_cols = ['id', 'smiles', 'agent', 'solvent', 'temperature', 'rxn_time', 'yield_percent', 'procedure_details']
-    for c in keep_cols:
-        if c not in df.columns:
-            df[c] = None
-    return df[keep_cols].copy()
-
-def mols_to_fp(mols, radius=FP_RADIUS, nBits=FP_NBITS):
-    arr = np.zeros((nBits,), dtype=np.int8)
-    for mol in mols:
-        if mol is None:
-            continue
-        try:
-            fp = rdMolDescriptors.GetMorganFingerprintAsBitVect(mol, radius, nBits=nBits)
-            tmp = np.zeros((nBits,), dtype=np.int8)
-            ConvertToNumpyArray(fp, tmp)
-            arr = np.bitwise_or(arr, tmp)
-        except Exception:
-            continue
-    return arr
-
-def reaction_to_fp(reaction_smiles: str, radius=FP_RADIUS, nBits=FP_NBITS):
-    if not reaction_smiles or str(reaction_smiles).strip() == "":
-        return np.zeros(nBits, dtype=np.int8)
-    smi = str(reaction_smiles)
-    smi_clean = _strip_atom_map(smi)
+@lru_cache(maxsize=200000)
+def _frag_to_fp_cached(frag_smiles: str, radius: int, nBits: int):
+    """
+    cached helper:-compute a fingerprint for single fragment smiles
+    return numpy uint8 array of length nBits (0/1).
+    """
     try:
-        parts = smi_clean.split('>>')
-        left = parts[0] if len(parts) > 0 else ''
-        right = parts[1] if len(parts) > 1 else ''
-        tokens = (left + '.' + right).split('.')
-        mols = []
-        for token in tokens:
-            token = token.strip()
-            if token == '':
-                continue
-            try:
-                m = Chem.MolFromSmiles(token)
-                mols.append(m)
-            except Exception:
-                mols.append(None)
-        return mols_to_fp(mols, radius=radius, nBits=nBits)
+        frag = frag_smiles.strip()
+        if frag == "" or frag == "\\N":
+            return None
+        # cheap guards
+        if len(frag) > MAX_FRAGMENT_LENGTH:
+            return None
+        # try parse
+        m = Chem.MolFromSmiles(frag)
+        if m is None:
+            # try more permissive cleanup- remove weird chars then parse
+            cand = RE_NON_PRINT.sub('', frag)
+            cand = RE_ATOM_MAP.sub('', cand)
+            cand = RE_KEEP.sub('', cand)
+            if len(cand) == 0 or len(cand) > MAX_FRAGMENT_LENGTH:
+                return None
+            m = Chem.MolFromSmiles(cand)
+            if m is None:
+                return None
+        # compute circular fingerprint bit vector (morgan)
+        fp = AllChem.GetMorganFingerprintAsBitVect(m, radius, nBits=nBits)
+        arr = np.zeros((nBits,), dtype=np.uint8)
+        DataStructs.ConvertToNumpyArray(fp, arr)
+        return arr
     except Exception:
-        return np.zeros(nBits, dtype=np.int8)
+        # any rdkit error then return None (treated as no bits)
+        return None
 
-def featurize_df(df: pd.DataFrame, radius=FP_RADIUS, nBits=FP_NBITS, show_progress: bool = True) -> Tuple[np.ndarray, Dict[str, Any]]:
-    n = len(df)
-    fps = np.zeros((n, nBits), dtype=np.int8)
-    bad_count = 0
-    it = tqdm(df['smiles'].fillna(''), desc="Featurizing", disable=not show_progress)
-    for i, smi in enumerate(it):
-        try:
-            fp = reaction_to_fp(smi, radius=radius, nBits=nBits)
-            fps[i, :] = fp
-        except KeyboardInterrupt:
-            raise
-        except Exception:
-            bad_count += 1
-            fps[i, :] = np.zeros((nBits,), dtype=np.int8)
-    if bad_count > 0:
-        print(f"Featurization: {bad_count} rows had parse/feature errors and were zeroed.")
-    meta = {
-        'fp_params': {'radius': radius, 'nbits': nBits},
-        'n_rows': n
-    }
-    return fps, meta
+
+def reaction_to_fp(reaction_smiles, radius=2, nBits=128):
+    """
+    convert reaction smiles (reactants...>>product) into a fingerprint vector
+    
+    split reactant fragments and product fragments
+    compute fragment fingerprints (cached)
+    bitwise-or them to build a reaction-level fingerprint
+    return float32 numpy vector shape (nBits,)
+    return zeros if input is invalid or cannot be parsed.
+    """
+    if reaction_smiles is None:
+        return np.zeros((nBits,), dtype=np.float32)
+    s = str(reaction_smiles).strip()
+    if s == "" or s == "\\N":
+        return np.zeros((nBits,), dtype=np.float32)
+
+    # remove obvious atom-mapping tokens like [C:1] or :1 (keep connectivity)
+    try:
+        s_clean = RE_ATOM_MAP.sub('', s)
+
+        s_clean = RE_NON_PRINT.sub('', s_clean) # non printable
+    except Exception:
+        s_clean = s
+
+    # split into reactants and products if possible
+    parts = s_clean.split(">>")
+    if len(parts) == 0:
+        return np.zeros((nBits,), dtype=np.float32)
+    reactants_part = parts[0] if parts[0] is not None else ""
+    product_part = parts[1] if len(parts) > 1 else ""
+
+    frags = []
+    # split reactants and products into fragments by '.' but cap fragments to avoid explosion
+    try:
+        react_frags = [f.strip() for f in reactants_part.split('.') if f.strip()]
+        prod_frags = [f.strip() for f in product_part.split('.') if f.strip()]
+        all_frags = react_frags + prod_frags
+    except Exception:
+        return np.zeros((nBits,), dtype=np.float32)
+
+    if len(all_frags) == 0 or len(all_frags) > MAX_TOTAL_FRAGMENTS:
+        # too many fragments (badly tokenized); bail to keep memory/cpu running
+        return np.zeros((nBits,), dtype=np.float32)
+
+    fp_accum = np.zeros((nBits,), dtype=np.uint8)
+    for frag in all_frags:
+        # cheap cleanup per frag
+        frag_norm = frag.strip()
+        if frag_norm == "" or frag_norm == "\\N":
+            continue
+        # remove atom mapping tokens and stray punctuation
+        frag_norm = RE_ATOM_MAP.sub('', frag_norm)
+        frag_norm = RE_NON_PRINT.sub('', frag_norm)
+        # if fragment still too large skip
+        if len(frag_norm) > MAX_FRAGMENT_LENGTH:
+            continue
+        # use cached fragment-level fingerprint function
+        arr = _frag_to_fp_cached(frag_norm, radius, nBits)
+        if arr is None:
+            continue
+        # OR bits
+        fp_accum = np.bitwise_or(fp_accum, arr)
+
+    return fp_accum.astype(np.float32)
+
+
+def load_orderly_csv(path, label_column="agent_norm"):
+    """
+    minimal loader used by training code; read CSV and filter rows where
+    label_column is non-empty (but does not touch smiles)
+    """
+    import pandas as pd
+    df = pd.read_csv(path, dtype=str, low_memory=False)
+    if label_column:
+        df = df[df[label_column].notna() & (df[label_column].astype(str).str.strip() != "")]
+    return df
