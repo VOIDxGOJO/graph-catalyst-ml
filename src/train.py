@@ -1,182 +1,224 @@
+
+"""
+balanced partial-fit trainer for catalyst (agent) classification
+does internal per-class downsampling, auto-aggregates agents,
+prints a full classification report on test set
+
+run-
+python -m src.train --train-csv path/to/train.csv --test-csv path/to/test.csv --out models/artifacts_balanced2.joblib --nbits 128 --cap-per-class 1000 --chunk-size 1000 --random-state 42 --exclude-other
+
+will try to use rxn_str or reaction_smiles as the smiles column
+will assemble agent labels using 'agent_norm' if present, otherwise concat agent_000..agent_002
 """
 
-partial_fit with SGDClassifier multiclass logistic to train in chunks
-builds sampled NearestNeighbors index for retrieval
-saves artifacts needed by server
-
-python -m src.train --train-csv ".\data\orderly_condition_with_rare_train_normalized.csv" --test-csv ".\data\orderly_condition_with_rare_test_normalized.csv" --out ".\models\artifacts_partial.joblib" --nbits 128 --max-rows 20000 --nn-sample 5000
-"""
 import argparse
 import os
-import math
+from pathlib import Path
 import joblib
+import math
 import numpy as np
 import pandas as pd
-from pathlib import Path
-from sklearn.linear_model import SGDClassifier
-from sklearn.preprocessing import LabelEncoder
-from sklearn.neighbors import NearestNeighbors
-from sklearn.metrics import classification_report, accuracy_score
 from tqdm import tqdm
+from sklearn.preprocessing import LabelEncoder
+from sklearn.linear_model import SGDClassifier
+from sklearn.metrics import classification_report, accuracy_score, confusion_matrix
+from src.data import reaction_to_fp, load_orderly_csv
 
-# local featurizer
-from src.data import featurize_df, reaction_to_fp, load_orderly_csv
+def safe_read_csv(path):
+    # read csv (pandas default engine; caller should ensure file is cleaned)
+    return pd.read_csv(path, dtype=str, low_memory=False)
 
-# helpers 
-def chunked_df(df, chunk_size):
-    # successive chunks of dataframe by row
-    for start in range(0, len(df), chunk_size):
-        yield df.iloc[start:start+chunk_size]
+def assemble_agent_norm(df):
+    # if agent_norm exists and looks populated, use it; otherwise, combine agent_000..agent_002
+    if 'agent_norm' in df.columns:
+        nonempty = df['agent_norm'].fillna('').astype(str).str.strip() != ''
+        if nonempty.sum() > 0:
+            return df['agent_norm'].fillna('').astype(str)
+    # fallback- join agent_000..agent_002 first non-empty
 
-# safe numeric
-def safe_float(x):
+    agent_cols = [c for c in ['agent_000','agent_001','agent_002'] if c in df.columns]
+    if not agent_cols:
+        # no agent columns at all- create empty series
+        return pd.Series([''] * len(df), index=df.index)
+    def choose_row(r):
+        for c in agent_cols:
+            v = r.get(c, '')
+            if pd.isna(v):
+                continue
+            s = str(v).strip()
+            if s != '' and s != '\\N':
+                return s
+        return ''
+    return df.apply(choose_row, axis=1)
+
+def build_classifier(random_state=42, class_weight=None):
+    # try log_loss then log
     try:
-        if x is None:
-            return None
-        f = float(x)
-        return f if math.isfinite(f) else None
+        return SGDClassifier(loss='log_loss', max_iter=1000, tol=1e-3, random_state=random_state, class_weight=class_weight)
     except Exception:
-        return None
+        return SGDClassifier(loss='log', max_iter=1000, tol=1e-3, random_state=random_state, class_weight=class_weight)
 
-# TRENN
-def train_and_save(train_csv, test_csv, out_path,
-                   fp_nbits=128,
-                   max_rows=None,
-                   chunk_size=2000,
-                   nn_sample=5000,
-                   random_state=42):
+def sample_balanced(df, label_col='agent_norm', cap=2000, random_state=42, exclude_other=False):
+    df = df.copy()
+    if exclude_other:
+        df[label_col] = df[label_col].fillna('').astype(str)
+        df = df[df[label_col].str.strip() != '']
+    # group and sample up to cap per class
+    parts = []
+    rng = np.random.RandomState(random_state)
+    counts = {}
+    for label, g in df.groupby(label_col):
+        n = len(g)
+        counts[label] = n
+        take = min(n, cap)
+        if n <= take:
+            parts.append(g)
+        else:
+            parts.append(g.sample(n=take, random_state=random_state))
+    if not parts:
+        return df.iloc[0:0], counts
+    out = pd.concat(parts, ignore_index=True).sample(frac=1.0, random_state=random_state).reset_index(drop=True)
+    return out, counts
 
-    print("Loading CSV (train)...")
-    df_train = load_orderly_csv(train_csv)
-    if test_csv and os.path.exists(test_csv):
-        print("Loading CSV (test)...")
-        df_test = load_orderly_csv(test_csv)
+def fp_stack(smiles_series, nBits):
+    # safe vstack of fingerprints
+    fps = []
+    for s in smiles_series.fillna('').astype(str):
+        fps.append(reaction_to_fp(s, nBits=nBits))
+    return np.vstack(fps) if fps else np.zeros((0, nBits), dtype=np.float32)
+
+def main(args):
+    print("Loading train CSV:", args.train_csv)
+    df_train = safe_read_csv(args.train_csv)
+    print("Train rows:", len(df_train))
+    # assemble label column
+    if 'agent_norm' in df_train.columns and df_train['agent_norm'].notna().sum() > 0:
+        df_train['agent_norm'] = df_train['agent_norm'].fillna('').astype(str)
     else:
-        df_test = None
+        df_train['agent_norm'] = assemble_agent_norm(df_train)
+    # identify smiles column
+    smiles_col = None
+    for cand in ['rxn_str', 'reaction_smiles', 'rxn_smiles', 'rxn_str_norm']:
+        if cand in df_train.columns:
+            smiles_col = cand
+            break
+    if smiles_col is None:
+        raise SystemExit("No SMILES column detected in training CSV. Expected one of rxn_str/reaction_smiles.")
+    print("Using SMILES column for training:", smiles_col)
 
-    if max_rows is not None and len(df_train) > max_rows:
-        print(f"Sampling {max_rows} rows from training set (random_state={random_state})")
-        df_train = df_train.sample(n=max_rows, random_state=random_state).reset_index(drop=True)
+    # balance sampling (cap per class)
+    print(f"Sampling balanced dataset with cap_per_class={args.cap_per_class}, exclude_other={args.exclude_other}")
+    df_bal, orig_counts = sample_balanced(df_train, label_col='agent_norm', cap=args.cap_per_class, random_state=args.random_state, exclude_other=args.exclude_other)
+    print("Original per-class counts (sample):")
 
-    print(f"Unique agents in train: {df_train['agent'].fillna('<<NULL>>').nunique()}")
+    # top 20 classes counts
+    for k, v in sorted(orig_counts.items(), key=lambda x: -x[1])[:30]:
+        print(f"  {k}: {v}")
+    print("Balanced dataset rows:", len(df_bal))
 
+    # prepare label encoder
+    y_vals = df_bal['agent_norm'].fillna('<<NULL>>').astype(str).values
     agent_le = LabelEncoder()
-    agent_vals = df_train['agent'].fillna('<<NULL>>').astype(str).values
-    agent_le.fit(agent_vals)
-    classes = agent_le.classes_
-    print(f"Number of agent classes: {len(classes)}")
+    agent_le.fit(y_vals)
+    n_classes = len(agent_le.classes_)
+    print("Label classes:", n_classes)
 
-    solvent_le = LabelEncoder()
-    solvent_vals = df_train['solvent'].fillna('<<NULL>>').astype(str).values
-    solvent_le.fit(solvent_vals)
+    # build classifier (not usign class_weight since weve balanced by sampling)
+    clf = build_classifier(random_state=args.random_state, class_weight=None)
 
-    clf_agent = SGDClassifier(loss='log_loss', max_iter=1000, tol=1e-3, random_state=random_state)
-    clf_solvent = SGDClassifier(loss='log_loss', max_iter=1000, tol=1e-3, random_state=random_state)
-
-    agent_class_indices = np.arange(len(agent_le.classes_))
-    solvent_class_indices = np.arange(len(solvent_le.classes_))
-
-    sampled_fp_rows = []
-    sampled_df_rows = []
-
-    print("Training classifiers with partial_fit in chunks...")
-
-    # iterate chunks of training df
-    for chunk in tqdm(list(chunked_df(df_train, chunk_size)), desc="train-chunks"):
-        X_chunk = np.vstack([reaction_to_fp(smi, radius=2, nBits=fp_nbits) for smi in chunk['smiles'].fillna('')])
-
-        y_agent_chunk = agent_le.transform(chunk['agent'].fillna('<<NULL>>').astype(str).values)
-        y_solvent_chunk = solvent_le.transform(chunk['solvent'].fillna('<<NULL>>').astype(str).values)
-
-
-        if not hasattr(clf_agent, 'coef_') or clf_agent.coef_.size == 0:
-            clf_agent.partial_fit(X_chunk, y_agent_chunk, classes=agent_class_indices)
+    # partial_fit training in chunks
+    chunk_size = args.chunk_size
+    print(f"Starting partial_fit over chunks (chunk_size={chunk_size}) ...")
+    for start in range(0, len(df_bal), chunk_size):
+        chunk = df_bal.iloc[start:start+chunk_size]
+        X_chunk = fp_stack(chunk[smiles_col], nBits=args.nbits)
+        y_chunk = agent_le.transform(chunk['agent_norm'].astype(str).values)
+        if not hasattr(clf, "classes_") or getattr(clf, "classes_", None) is None or clf.classes_.size == 0:
+            clf.partial_fit(X_chunk, y_chunk, classes=np.arange(n_classes))
         else:
-            clf_agent.partial_fit(X_chunk, y_agent_chunk)
+            clf.partial_fit(X_chunk, y_chunk)
 
-        if not hasattr(clf_solvent, 'coef_') or clf_solvent.coef_.size == 0:
-            clf_solvent.partial_fit(X_chunk, y_solvent_chunk, classes=solvent_class_indices)
+    print("Finished training.")
+
+    # build small NN index sampled from balanced df
+    try:
+        from sklearn.neighbors import NearestNeighbors
+        nn_sample = min(args.nn_sample, len(df_bal))
+        if nn_sample > 0:
+            idx = np.random.RandomState(args.random_state).choice(len(df_bal), size=nn_sample, replace=False)
+            X_fp_for_nn = fp_stack(df_bal.iloc[idx][smiles_col], nBits=args.nbits)
+            df_for_nn = df_bal.iloc[idx].reset_index(drop=True)
+            nn_index = NearestNeighbors(n_neighbors=min(6, len(X_fp_for_nn)), metric='cosine', algorithm='brute')
+            nn_index.fit(X_fp_for_nn)
+            print("Built NN index on sampled balanced fingerprints:", len(X_fp_for_nn))
         else:
-            clf_solvent.partial_fit(X_chunk, y_solvent_chunk)
-
-       
-        rng = np.random.default_rng(random_state)
-        take = min(len(chunk), max(0, int(round(len(chunk) * (nn_sample / max(len(df_train), 1))))))  # proportionally
-        if take > 0:
-            idx = rng.choice(len(chunk), size=take, replace=False)
-            sampled_fp_rows.append(X_chunk[idx])
-            sampled_df_rows.append(chunk.iloc[idx])
-
-    print("Finished partial-fit training")
-
-    if sampled_fp_rows:
-        X_fp_for_nn = np.vstack(sampled_fp_rows)
-        df_for_nn = pd.concat(sampled_df_rows, ignore_index=True).reset_index(drop=True)
-    else:
+            nn_index = None
+            X_fp_for_nn = None
+            df_for_nn = None
+    except Exception as e:
+        print("NearestNeighbors failed:", e)
+        nn_index = None
         X_fp_for_nn = None
         df_for_nn = None
 
-    if df_test is not None:
-        print("Evaluating on test set (skipping unseen agent labels)...")
-        X_test_rows = []
-        for chunk in chunked_df(df_test, chunk_size):
-            X_test_rows.append(np.vstack([reaction_to_fp(smi, radius=2, nBits=fp_nbits) for smi in chunk['smiles'].fillna('')]))
-        X_test = np.vstack(X_test_rows) if X_test_rows else np.zeros((0, fp_nbits))
-
-        test_agent_raw = df_test['agent'].fillna('<<NULL>>').astype(str).values
-        mask_in_train = np.array([ (lbl in set(agent_le.classes_)) for lbl in test_agent_raw ])
-        if mask_in_train.any():
-            y_true = agent_le.transform(test_agent_raw[mask_in_train])
-            y_pred = clf_agent.predict(X_test[mask_in_train])
-            print("Agent classification report (test subset with known labels):")
-            print(classification_report(y_true, y_pred, zero_division=0))
-            print("Agent test accuracy (subset):", accuracy_score(y_true, y_pred))
-        else:
-            print("No test labels matched training classes; skipping agent eval.")
-
-    # build NN index on sampled fps if available
-    nn_index = None
-    if X_fp_for_nn is not None and len(X_fp_for_nn) > 0:
-        try:
-            n_neighbors = min(6, len(X_fp_for_nn))
-            nn_index = NearestNeighbors(n_neighbors=n_neighbors, metric='cosine', algorithm='brute')
-            nn_index.fit(X_fp_for_nn)
-            print("Built NearestNeighbors index on sampled fingerprints (size=%d)." % len(X_fp_for_nn))
-        except Exception as e:
-            print("NearestNeighbors build failed:", e)
-            nn_index = None
-
+    # evaluate on test set if provided
     artifacts = {
-        "clf_agent": clf_agent,
+        "clf_agent": clf,
         "agent_le": agent_le,
-        "clf_solvent": clf_solvent,
-        "solvent_le": solvent_le,
         "nn_index": nn_index,
         "X_fp_for_nn": X_fp_for_nn,
         "df_for_nn": df_for_nn,
-
-        "train_metadata": {
-            "train_rows": len(df_train),
-            "nbits": fp_nbits
-        }
+        "train_metadata": {"train_rows_used": len(df_bal), "nbits": args.nbits, "cap_per_class": args.cap_per_class}
     }
 
-    Path(os.path.dirname(out_path) or ".").mkdir(parents=True, exist_ok=True)
-    joblib.dump(artifacts, out_path, compress=3)
-    print("Saved artifacts to:", out_path)
-    return artifacts
+    if args.test_csv and os.path.exists(args.test_csv):
+        print("Loading test CSV:", args.test_csv)
+        df_test = safe_read_csv(args.test_csv)
+        # assemble labels on test too
+        if 'agent_norm' not in df_test.columns or df_test['agent_norm'].notna().sum() == 0:
+            df_test['agent_norm'] = assemble_agent_norm(df_test)
+        # select test rows that have labels present in encoder
+        test_mask = df_test['agent_norm'].fillna('').astype(str).str.strip() != ''
+        df_test = df_test[test_mask].reset_index(drop=True)
+        if len(df_test) == 0:
+            print("No labeled rows in test file; skipping test eval.")
+        else:
+            # only evaluate on labels present in train encoder
+            train_classes = set(agent_le.classes_.astype(str))
+            test_mask_known = df_test['agent_norm'].astype(str).isin(train_classes)
+            if not test_mask_known.any():
+                print("No test rows have labels seen during training; skipping eval.")
+            else:
+                df_test_known = df_test[test_mask_known].reset_index(drop=True)
+                X_test = fp_stack(df_test_known[smiles_col], nBits=args.nbits)
+                y_test = agent_le.transform(df_test_known['agent_norm'].astype(str).values)
+                y_pred = clf.predict(X_test)
+                print("Classification report on test subset (labels present in training):")
+                print(classification_report(y_test, y_pred, zero_division=0, target_names=agent_le.classes_))
+                acc = accuracy_score(y_test, y_pred)
+                print("Accuracy (subset):", acc)
+                cm = confusion_matrix(y_test, y_pred)
+                print("Confusion matrix shape:", cm.shape)
+                artifacts['eval'] = {"accuracy": acc, "report": classification_report(y_test, y_pred, zero_division=0), "confusion_matrix": cm}
+    else:
+        print("No test CSV provided or path does not exist; skipping test eval.")
 
+    # save artifact
+    out_dir = os.path.dirname(args.out) or "."
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    joblib.dump(artifacts, args.out)
+    print("Saved artifact to:", args.out)
 
 if __name__ == "__main__":
     p = argparse.ArgumentParser()
     p.add_argument("--train-csv", required=True)
-    p.add_argument("--test-csv", default=None)
-    p.add_argument("--out", default="models/artifacts_partial.joblib")
+    p.add_argument("--test-csv", required=False, default=None)
+    p.add_argument("--out", required=True)
     p.add_argument("--nbits", type=int, default=128)
-    p.add_argument("--max-rows", type=int, default=20000, help="Max train rows to use (None=all)")
-    p.add_argument("--chunk-size", type=int, default=2000, help="Rows per partial_fit chunk")
-    p.add_argument("--nn-sample", type=int, default=5000, help="Rows to sample for NN index (0 = disabled)")
+    p.add_argument("--chunk-size", type=int, default=1000)
+    p.add_argument("--nn-sample", type=int, default=1000)
+    p.add_argument("--cap-per-class", type=int, default=2000, help="Max samples to keep per class (downsample majority)")
+    p.add_argument("--exclude-other", action="store_true", help="Drop empty/OTHER labels before sampling")
+    p.add_argument("--random-state", type=int, default=42)
     args = p.parse_args()
-
-    mt = args.max_rows if args.max_rows is not None else None
-    train_and_save(args.train_csv, args.test_csv, args.out, fp_nbits=args.nbits, max_rows=mt, chunk_size=args.chunk_size, nn_sample=args.nn_sample)
+    main(args)
