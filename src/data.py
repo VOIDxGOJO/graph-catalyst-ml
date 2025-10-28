@@ -1,7 +1,6 @@
 """
 featurizer utils for reaction smiles
 
-
 atom mapping removal and light cleaning
 fragment-level LRU cache for Morgan fingerprints (huge speed up if many repeated fragments)
 skip extremely long fragments cheaply
