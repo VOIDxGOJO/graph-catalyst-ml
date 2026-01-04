@@ -159,7 +159,7 @@ def main():
                 smi = line.strip()
                 if not smi:
                     continue
-                print("\n=== NEXT SMILES ===")
+                print("\nNEXT SMILES")
                 predict_single(artifact, smi, topk=args.topk)
 
 if __name__ == "__main__":
