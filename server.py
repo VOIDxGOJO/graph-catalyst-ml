@@ -21,7 +21,7 @@ from pydantic import BaseModel
 from src.data import reaction_to_fp
 
 # config through env
-ARTIFACT_PATH = os.environ.get("ARTIFACT_PATH", "./models/artifacts_balanced2.joblib")
+ARTIFACT_PATH = os.environ.get("ARTIFACT_PATH", "artifacts_balanced2.joblib")
 CONFIDENCE_THRESHOLD = float(os.environ.get("CONF_THRESHOLD", "0.30"))
 TOP_K_ALTS = int(os.environ.get("TOP_K_ALTS", "5"))
 NN_RETURN = int(os.environ.get("NN_RETURN", "5"))
