@@ -68,6 +68,7 @@ class PredictRequest(BaseModel):
 #     _artifact.setdefault("nbits", 128)
 #     return _artifact
 
+# check exact errors
 def load_artifact(path: str = ARTIFACT_PATH):
     global _artifact, _artifact_load_time
     if _artifact is not None:
@@ -82,7 +83,7 @@ def load_artifact(path: str = ARTIFACT_PATH):
     try:
         _artifact = joblib.load(str(p))
     except Exception as e:
-        print("🔥 JOBLIB LOAD FAILED:", repr(e), file=sys.stderr)
+        print("JOBLIB LOAD FAILED:", repr(e), file=sys.stderr)
         raise
 
     _artifact_load_time = time.time()
