@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: catalyst-backend
+    env: python
+    plan: free
+    buildCommand: "pip install -r requirements-prod.txt"
+    startCommand: "uvicorn server:app --host 0.0.0.0 --port $PORT --workers 1"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
