@@ -1,5 +1,5 @@
-const API_BASE = (window.__API_BASE && window.__API_BASE !== "") ? window.__API_BASE : "http://127.0.0.1:8000";
-const API_ENDPOINT = `${API_BASE.replace(/\/$/, "")}/predict`;
+const API_BASE = "https://graph-catalyst-ml.onrender.com";
+const API_ENDPOINT = `${API_BASE}/predict`;
 
 const form = document.getElementById("predict-form");
 const smilesInput = document.getElementById("smiles");
