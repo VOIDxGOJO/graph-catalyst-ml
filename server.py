@@ -197,6 +197,12 @@ def predict(req: PredictRequest):
 
     return response
 
+@app.get("/debug-files")
+def debug_files():
+    import os
+    return {"files": os.listdir(".")}
+
+
 @app.get("/")
 def root():
     try:
