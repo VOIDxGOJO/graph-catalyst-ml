@@ -2,8 +2,8 @@
 pandas==2.2.2
 scikit-learn==1.3.2
 joblib==1.3.2
-numpy==1.27.5
-rdkit-pypi==2024.9.3  # if installation problems, install RDKit via conda
+numpy==1.26.4
+rdkit-pypi==2022.9.5  # if installation problems, install RDKit via conda
 tqdm==4.66.1
 
 # Backend
