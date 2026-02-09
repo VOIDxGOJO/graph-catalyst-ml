@@ -1,0 +1,20 @@
+name: Render Backend Cron
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Ping Render Health Endpoint
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://graph-catalyst-ml.onrender.com/health)
+          echo "HTTP Status: $STATUS"
+          if [ "$STATUS" -ne 200 ]; then
+            echo "Backend is not responding properly!"
+            exit 1
+          fi
