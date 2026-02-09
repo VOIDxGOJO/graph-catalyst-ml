@@ -47,26 +47,51 @@ class PredictRequest(BaseModel):
     yield_percent: Optional[float] = None
 
 # helper utils
+# def load_artifact(path: str = ARTIFACT_PATH):
+#     """Load artifact if not loaded. Return artifact dict."""
+#     global _artifact, _artifact_load_time
+#     if _artifact is not None:
+#         return _artifact
+
+#     p = Path(path)
+#     if not p.exists():
+#         raise FileNotFoundError(f"Artifact not found at {path}")
+#     _artifact = joblib.load(str(p))
+#     _artifact_load_time = time.time()
+#     # basic validation
+#     if "clf_agent" not in _artifact or "agent_le" not in _artifact:
+#         raise RuntimeError("Artifact missing required keys 'clf_agent' or 'agent_le'")
+#     # ensure some optional keys exist (set None if missing)
+#     _artifact.setdefault("nn_index", None)
+#     _artifact.setdefault("X_fp_for_nn", None)
+#     _artifact.setdefault("df_for_nn", None)
+#     _artifact.setdefault("nbits", 128)
+#     return _artifact
+
 def load_artifact(path: str = ARTIFACT_PATH):
-    """Load artifact if not loaded. Return artifact dict."""
     global _artifact, _artifact_load_time
     if _artifact is not None:
         return _artifact
 
     p = Path(path)
+    print("DEBUG: trying to load artifact at", p.resolve(), file=sys.stderr)
+
     if not p.exists():
         raise FileNotFoundError(f"Artifact not found at {path}")
-    _artifact = joblib.load(str(p))
+
+    try:
+        _artifact = joblib.load(str(p))
+    except Exception as e:
+        print("🔥 JOBLIB LOAD FAILED:", repr(e), file=sys.stderr)
+        raise
+
     _artifact_load_time = time.time()
-    # basic validation
+
     if "clf_agent" not in _artifact or "agent_le" not in _artifact:
-        raise RuntimeError("Artifact missing required keys 'clf_agent' or 'agent_le'")
-    # ensure some optional keys exist (set None if missing)
-    _artifact.setdefault("nn_index", None)
-    _artifact.setdefault("X_fp_for_nn", None)
-    _artifact.setdefault("df_for_nn", None)
-    _artifact.setdefault("nbits", 128)
+        raise RuntimeError("Artifact missing required keys")
+
     return _artifact
+
 
 def softmax_from_decision_function(clf, X):
     # return (pred_idx_array, top_conf_array, alts_list_of_lists) using decision_function then stable softmax
