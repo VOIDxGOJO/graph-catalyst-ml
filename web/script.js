@@ -22,20 +22,20 @@ const downloadBtn = document.getElementById("download-btn");
 
 const SAMPLES = [
     {
-        label: "Hydrogenation (Pt)",
+        label: "Nitro amine hydrogenation",
         smiles: "CC(=O)c1cc(C)cc([N+](=O)[O-])c1O>>CC(=O)c1cc(C)cc(N)c1O",
         product: "CC(=O)c1cc(C)cc(N)c1O",
-        solvent: "CCO",
+        solvent: "",
         temp: "25",
         rxn_time: "0.73"
     },
     {
-        label: "O-alkylation (K t-Bu)",
-        smiles: "Nc1ccc(O)cc1F.CC(C)([O-])[K+].Cl[C:17]1...>>COc1cc(Cl)ccn1",
-        product: "COc1cc(Cl)ccn1",
-        solvent: "DMA",
-        temp: "25",
-        rxn_time: "1"
+        label: "Pd-type cross-coupling (Heck / arylation)",
+        smiles: "Clc1ccccc1.C=CCBr>>Clc1ccccc1C=CC",
+        product: "Clc1ccccc1C=CC",
+        solvent: "",
+        temp: "80",
+        rxn_time: "4"
     }
 ];
 
