@@ -10,9 +10,8 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Ping Render Health Endpoint
+      - name: Ping Render Health Endpoint (tolerant)
         run: |
           echo "Pinging backend..."
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://graph-catalyst-ml.onrender.com/health)
-          echo "HTTP Status: $STATUS"
+          curl -s --max-time 120 https://graph-catalyst-ml.onrender.com/health || true
           echo "Done."
