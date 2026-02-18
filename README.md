@@ -7,7 +7,7 @@ It uses **graph-based ML** (Morgan fingerprints via RDKit) trained on the **ORDe
 
 ## Quick Start
 
-### Clone the repo
+### Clone the repository
 ```cmd
 git clone https://github.com/dshryn/graph-catalyst-ml.git
 cd graph-catalyst-ml
