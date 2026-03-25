@@ -27,6 +27,7 @@ for k in art:
 # check if nbits or train_metadata present
 print("nbits in artifact:", art.get("nbits") or art.get("train_metadata",{}).get("nbits"))
 print("nn_index present?:", ("nn_index" in art) and (art.get("nn_index") is not None))
+
 # check sample fingerprint shape if exists
 if art.get("X_fp_for_nn") is not None:
     import numpy as np
