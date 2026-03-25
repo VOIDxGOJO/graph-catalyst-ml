@@ -36,7 +36,8 @@ def main(p):
         X = art.get("X_fp_for_nn")
         try:
             print("X_fp_for_nn shape:", getattr(X, "shape", None), "dtype:", getattr(X, "dtype", None))
-            print("bit-count stats (first 10 rows):", [int(x.sum()) for x in X[:10]])
+            if X is not None and hasattr(X, '__getitem__'):
+                print("bit-count stats (first 10 rows):", [int(x.sum()) for x in X[:10]])
         except Exception as e:
             print("X_fp_for_nn inspect error:", e)
     # nn_index

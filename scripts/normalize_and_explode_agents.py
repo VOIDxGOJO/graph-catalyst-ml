@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """
 
 reads input CSV in chunks (pandas.read_csv with chunksize)
